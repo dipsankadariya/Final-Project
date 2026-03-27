@@ -15,17 +15,20 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
+os.environ["MAX_NEW_TOKENS"] = "1024"
+os.environ["TOP_K"] = "5"
+
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-MODEL_REPO = os.environ.get("MODEL_REPO", "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-v3")
+MODEL_REPO = os.environ.get("MODEL_REPO", "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-base")
 DATASET_NAME = os.environ.get("DATASET_NAME", "zeri000/augmented_nepali_legal_qa.csv")
 INDEX_PATH = os.environ.get("INDEX_PATH", "./legal_faiss.index")
 DOCS_PATH = os.environ.get("DOCS_PATH", "./legal_docs.npy")
 TOP_K = int(os.environ.get("TOP_K", "3"))
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "128"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
 
 SYSTEM_PROMPT = (
-    "तपाईं नेपालको एक वरिष्ठ कानूनी विशेषज्ञ हुनुहुन्छ। "
+    "तपाईं नेपलको एक वरिष्ठ कानूनी विशेषज्ञ हुनुहुन्छ। "
     "प्रश्नको उत्तर दिँदा: "
     "१) सम्बन्धित ऐन वा धारा उल्लेख गर्नुहोस्, "
     "२) स्पष्ट र संक्षिप्त भाषामा व्याख्या गर्नुहोस्, " 
