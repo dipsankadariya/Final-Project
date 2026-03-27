@@ -1,0 +1,23 @@
+# Python
+backend/__pycache__/
+backend/.venv*/
+backend/*.pyc
+
+# Backend artifacts
+backend/legal_faiss.index
+backend/legal_docs.npy
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# Environment files
+*.env
+*.env.local
+*.env.development
+*.env.production
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
