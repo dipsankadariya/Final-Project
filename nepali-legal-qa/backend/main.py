@@ -86,8 +86,12 @@ def _get_eos_ids(tokenizer) -> List[int]:
     return ids
 
 
-def _generate_hyde(messages: list, max_new_tokens: int) -> str:
-    """Generation for HyDE passages (uses sampling for diversity)."""
+def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
+    """Shared generation helper matching the notebook RAG code.
+
+    Used for both HyDE passage generation and the final answer:
+    temperature=0.01, do_sample=True, top_p=0.95, repetition_penalty=1.2.
+    """
     tokenizer  = state["tokenizer"]
     model      = state["model"]
     eos_ids    = _get_eos_ids(tokenizer)
@@ -105,36 +109,9 @@ def _generate_hyde(messages: list, max_new_tokens: int) -> str:
             temperature        = 0.01,
             do_sample          = True,
             top_p              = 0.95,
-            repetition_penalty = 1.0,
+            repetition_penalty = 1.2,
             eos_token_id       = eos_ids,
             use_cache          = True,
-        )
-
-    new_tokens = output_ids[0][input_len:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-
-def _generate_answer(messages: list, max_new_tokens: int) -> str:
-    """Generation for the final answer (greedy, less hallucination)."""
-    tokenizer  = state["tokenizer"]
-    model      = state["model"]
-    eos_ids    = _get_eos_ids(tokenizer)
-
-    prompt     = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs     = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len  = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens       = max_new_tokens,
-            do_sample            = False,
-            repetition_penalty   = 1.2,
-            no_repeat_ngram_size = 4,
-            eos_token_id         = eos_ids,
-            use_cache            = True,
         )
 
     new_tokens = output_ids[0][input_len:]
@@ -146,7 +123,7 @@ def _hyde_retrieve(question: str, top_k: int):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": question.strip()},
     ]
-    hypothetical_passage = _generate_hyde(hyde_messages, max_new_tokens=HYDE_TOKENS)
+    hypothetical_passage = _generate_with_slm(hyde_messages, max_new_tokens=HYDE_TOKENS)
 
     # E5 convention: "query:" prefix for the search query (asymmetric retrieval)
     query_emb = state["embedder"].encode(
@@ -175,17 +152,13 @@ def _rag_answer(question: str, top_k: int) -> dict:
     answer_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": (
-            "प्रश्न (Question):\n"
-            f"{question.strip()}\n\n"
-            "तलका कानूनी सन्दर्भहरूको आधारमा मात्र उत्तर दिनुहोस्। "
-            "सन्दर्भमा नआएका कुरा नबनाउनुहोस्। सन्दर्भ पर्याप्त नहुँदा "
-            '"मसँग पर्याप्त कानूनी सन्दर्भ उपलब्ध छैन" भनेर भन्नुहोस्।\n\n'
-            "सन्दर्भ (Context):\n"
+            f"{question.strip()}"  # question
+            "\n\nतलका कानूनी सन्दर्भहरूको आधारमा विस्तृत उत्तर दिनुहोस्:\n\n"
             f"{context_block}"
         )},
     ]
 
-    final_answer = _generate_answer(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
+    final_answer = _generate_with_slm(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
 
     return {
         "question":       question,
