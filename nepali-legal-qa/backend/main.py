@@ -11,7 +11,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -71,9 +72,9 @@ def generate(messages: list, max_new_tokens: int) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens       = max_new_tokens,
-            do_sample            = False,  # greedy decoding — most stable for small models
-            repetition_penalty   = 1.3,    # higher value stops repetition loops
-            no_repeat_ngram_size = 4,      # blocks any 4-word phrase from repeating
+            do_sample            = False,
+            repetition_penalty   = 1.3,
+            no_repeat_ngram_size = 4,
             eos_token_id         = get_eos_ids(tokenizer),
             use_cache            = True,
         )
@@ -137,12 +138,11 @@ async def lifespan(app: FastAPI):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"device: {device}")
 
-    # Always delete old index files so they rebuild from the correct dataset.
-    # Colab caches files on disk between runs which caused wrong results before.
+    # Delete old index files so they always rebuild fresh
     for old_file in [INDEX_PATH, DOCS_PATH]:
         if os.path.exists(old_file):
             os.remove(old_file)
-            log.info(f"deleted old index file: {old_file}")
+            log.info(f"deleted old index: {old_file}")
 
     # Load embedding model
     log.info(f"loading embedding model: {EMBED_MODEL}")
@@ -150,31 +150,23 @@ async def lifespan(app: FastAPI):
     embed_dim = state["embedder"].get_sentence_embedding_dimension()
     log.info(f"embedder ready  dim={embed_dim}")
 
-    # Load language modela
+    # Load language model with unsloth — required for this model to decode correctly
     log.info(f"loading language model: {MODEL_REPO}")
     hf_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
 
-    state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_REPO, **hf_kwargs)
+    state["model"], state["tokenizer"] = FastLanguageModel.from_pretrained(
+        model_name     = MODEL_REPO,
+        max_seq_length = 2048,
+        dtype          = None,
+        load_in_4bit   = True,
+        **hf_kwargs,
+    )
+    state["tokenizer"] = get_chat_template(state["tokenizer"], chat_template="chatml")
+    FastLanguageModel.for_inference(state["model"])
 
-    if device == "cuda":
-        state["model"] = AutoModelForCausalLM.from_pretrained(
-            MODEL_REPO,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            **hf_kwargs,
-        )
-    else:
-        state["model"] = AutoModelForCausalLM.from_pretrained(
-            MODEL_REPO,
-            torch_dtype=torch.float32,
-            device_map={"": "cpu"},
-            **hf_kwargs,
-        )
-
-    state["model"].eval()
     log.info("language model ready")
 
-    # Build FAISS index from the correct dataset
+    # Build FAISS index
     log.info(f"building faiss index from: {DATASET_NAME}")
     from datasets import load_dataset
 
@@ -195,7 +187,7 @@ async def lifespan(app: FastAPI):
 
         docs.append(passage)
 
-    log.info(f"embedding {len(docs)} passages — takes a few minutes")
+    log.info(f"embedding {len(docs)} passages")
 
     BATCH    = 64
     all_embs = []
@@ -227,17 +219,11 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="Nepali Legal QA", version="1.2.0", lifespan=lifespan)
-
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://quiana-selenitical-robin.ngrok-free.dev",
-]
+app = FastAPI(title="Nepali Legal QA", version="1.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
