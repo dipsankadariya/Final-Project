@@ -150,7 +150,7 @@ async def lifespan(app: FastAPI):
     embed_dim = state["embedder"].get_sentence_embedding_dimension()
     log.info(f"embedder ready  dim={embed_dim}")
 
-    # Load language model
+    # Load language modela
     log.info(f"loading language model: {MODEL_REPO}")
     hf_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
 
@@ -229,9 +229,15 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="Nepali Legal QA", version="1.2.0", lifespan=lifespan)
 
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://quiana-selenitical-robin.ngrok-free.dev",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
