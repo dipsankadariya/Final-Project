@@ -25,10 +25,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 HF_TOKEN        = os.environ.get("HF_TOKEN", "")
 MODEL_REPO      = os.environ.get("MODEL_REPO",   "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
-DEFAULT_EMBED_MODEL  = "ritesh-07/nepali-legal-e5-finetuned"
-FALLBACK_EMBED_MODEL = "intfloat/multilingual-e5-base"
-EMBED_MODEL          = os.environ.get("EMBED_MODEL", DEFAULT_EMBED_MODEL)
-DATASET_NAME         = os.environ.get("DATASET_NAME", "chhatramani/Nepali_Legal_QA")
+EMBED_MODEL     = os.environ.get("EMBED_MODEL",  "intfloat/multilingual-e5-base")
+DATASET_NAME    = os.environ.get("DATASET_NAME", "zeri000/augmented_nepali_legal_qa.csv")
 
 INDEX_PATH      = os.environ.get("INDEX_PATH",  "./legal_faiss.index")
 DOCS_PATH       = os.environ.get("DOCS_PATH",   "./legal_docs.npy")
@@ -36,7 +34,6 @@ DOCS_PATH       = os.environ.get("DOCS_PATH",   "./legal_docs.npy")
 TOP_K           = int(os.environ.get("TOP_K",          "5"))
 MAX_NEW_TOKENS  = int(os.environ.get("MAX_NEW_TOKENS",  "512"))
 HYDE_TOKENS     = int(os.environ.get("HYDE_TOKENS",     "256"))
-MIN_SIM         = float(os.environ.get("MIN_SIM",       "0.25"))
 
 SYSTEM_PROMPT   = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
 
@@ -59,8 +56,8 @@ def _get_eos_ids(tokenizer) -> List[int]:
     return ids
 
 
-def _generate_with_slm(messages: list, max_new_tokens: int, for_answer: bool = False) -> str:
-
+def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
+    
     tokenizer  = state["tokenizer"]
     model      = state["model"]
     eos_ids    = _get_eos_ids(tokenizer)
@@ -71,24 +68,16 @@ def _generate_with_slm(messages: list, max_new_tokens: int, for_answer: bool = F
     inputs     = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_len  = inputs["input_ids"].shape[1]
 
-    gen_kwargs = dict(
-        max_new_tokens     = max_new_tokens,
-        temperature        = 0.01,
-        do_sample          = True,
-        top_p              = 0.95,
-        repetition_penalty = 1.2,
-        eos_token_id       = eos_ids,
-        use_cache          = True,
-    )
-
-    if for_answer:
-        gen_kwargs["no_repeat_ngram_size"] = 4
-        gen_kwargs["repetition_penalty"]   = 1.25
-
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            **gen_kwargs,
+            max_new_tokens     = max_new_tokens,
+            temperature        = 0.01,
+            do_sample          = True,
+            top_p              = 0.95,
+            repetition_penalty = 1.2,
+            eos_token_id       = eos_ids,
+            use_cache          = True,
         )
 
     new_tokens = output_ids[0][input_len:]
@@ -100,29 +89,16 @@ def _hyde_retrieve(question: str, top_k: int):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": question.strip()},
     ]
-    hypothetical_passage = _generate_with_slm(
-        hyde_messages,
-        max_new_tokens=HYDE_TOKENS,
-        for_answer=False,
-    )
+    hypothetical_passage = _generate_with_slm(hyde_messages, max_new_tokens=HYDE_TOKENS)
 
-    query_text = question.strip()
     query_emb = state["embedder"].encode(
-        [f"query: {query_text}"],
+        [f"query: {hypothetical_passage}"],
         normalize_embeddings=True,
     ).astype("float32")
 
-    scores, indices = state["index"].search(query_emb, top_k)
-    docs            = state["docs"]
-
-    retrieved = []
-    for idx, score in zip(indices[0], scores[0]):
-        if idx < len(docs) and score >= MIN_SIM:
-            retrieved.append(docs[idx])
-
-    if not retrieved and len(docs) > 0 and indices[0][0] < len(docs):
-        retrieved.append(docs[indices[0][0]])
-
+    _, indices = state["index"].search(query_emb, top_k)
+    docs       = state["docs"]
+    retrieved  = [docs[i] for i in indices[0] if i < len(docs)]
     return hypothetical_passage, retrieved
 
 
@@ -144,15 +120,10 @@ def _rag_answer(question: str, top_k: int) -> dict:
             f"{question.strip()}"
             "\n\nतलका कानूनी सन्दर्भहरूको आधारमा विस्तृत उत्तर दिनुहोस्:\n\n"
             f"{context_block}"
-            "\n\nयदि माथि दिइएका सन्दर्भहरूमा आवश्यक जानकारी नपाएमा 'उपलब्ध सन्दर्भमा छैन' भनेर स्पष्ट रूपमा जवाफ दिनुहोस्।"
         )},
     ]
 
-    final_answer = _generate_with_slm(
-        answer_messages,
-        max_new_tokens=MAX_NEW_TOKENS,
-        for_answer=True,
-    )
+    final_answer = _generate_with_slm(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
 
     return {
         "question":       question,
@@ -170,17 +141,11 @@ def _build_index(embedder, embed_dim: int):
         output      = str(row.get("output",      "")).strip()
         context     = str(row.get("input",       "")).strip()
 
-        parts = []
-        if output:
-            parts.append(output)
+        passage = instruction
         if context:
-            parts.append(context)
-        if instruction:
-            parts.append("प्रश्न: " + instruction)
-
-        passage = "\n".join(parts).strip()
-        if not passage:
-            continue
+            passage += "\n" + context
+        if output:
+            passage += "\n" + output
 
         docs.append(passage)
 
@@ -230,16 +195,8 @@ async def lifespan(app: FastAPI):
     log.info(f"device: {device}")
 
     log.info(f"loading embedding model: {EMBED_MODEL}")
-    try:
-        embedder = SentenceTransformer(EMBED_MODEL, device=device)
-    except Exception as exc:
-        log.warning(
-            f"failed to load embedder '{EMBED_MODEL}' ({exc}), falling back to {FALLBACK_EMBED_MODEL}"
-        )
-        embedder = SentenceTransformer(FALLBACK_EMBED_MODEL, device=device)
-
-    state["embedder"] = embedder
-    embed_dim         = embedder.get_sentence_embedding_dimension()
+    state["embedder"] = SentenceTransformer(EMBED_MODEL, device=device)
+    embed_dim         = state["embedder"].get_sentence_embedding_dimension()
     log.info(f"embedder ready  dim={embed_dim}")
 
     log.info(f"loading language model: {MODEL_REPO}")
