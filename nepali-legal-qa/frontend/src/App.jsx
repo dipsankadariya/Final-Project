@@ -291,7 +291,7 @@ export default function App() {
                 onKeyDown={handleKey}
                 disabled={loading}
                 placeholder="नेपाली वा अंग्रेजीमा प्रश्न सोध्नुहोस्… (Ask in Nepali or English)"
-                className="w-full resize-none text-sm text-gray-800 placeholder-gray-300 bg-transparent outline-none leading-relaxed disabled:opacity-50"
+                className="w-full resize-none text-sm text-gray-800 placeholder-gray-500 bg-transparent outline-none leading-relaxed disabled:opacity-50"
                 style={{ minHeight: '44px', maxHeight: '160px', overflowY: 'auto' }}
               />
             </div>
@@ -362,12 +362,12 @@ export default function App() {
 
       <footer className="border-t border-purple-100 bg-white">
         <div className="max-w-5xl mx-auto px-5 h-10 flex items-center justify-between">
-          <span className="text-[11px] text-gray-300">Dipsan99 · HyDE-RAG · Qwen2.5-3B</span>
+          <span className="text-[11px] text-gray-500">Dipsan99 · HyDE-RAG · Qwen2.5-3B</span>
           <div className="flex items-center gap-4">
             <a href="https://huggingface.co/Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged" target="_blank" rel="noreferrer"
-              className="text-[11px] text-gray-300 hover:text-purple-600 transition-colors">Model</a>
+              className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">Model</a>
             <a href="https://huggingface.co/datasets/zeri000/augmented_nepali_legal_qa.csv" target="_blank" rel="noreferrer"
-              className="text-[11px] text-gray-300 hover:text-purple-600 transition-colors">Dataset</a>
+              className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">Dataset</a>
           </div>
         </div>
       </footer>

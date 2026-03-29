@@ -3,6 +3,7 @@ import time
 import logging
 from contextlib import asynccontextmanager
 from typing import List
+
 import numpy as np
 import torch
 import faiss
@@ -12,111 +13,239 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+# ─────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 log = logging.getLogger(__name__)
 
-os.environ["MAX_NEW_TOKENS"] = "1024"
-os.environ["TOP_K"] = "5"
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
-MODEL_REPO = os.environ.get("MODEL_REPO", "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "intfloat/multilingual-e5-base")
-DATASET_NAME = os.environ.get("DATASET_NAME", "zeri000/augmented_nepali_legal_qa.csv")
-INDEX_PATH = os.environ.get("INDEX_PATH", "./legal_faiss.index")
-DOCS_PATH = os.environ.get("DOCS_PATH", "./legal_docs.npy")
-TOP_K = int(os.environ.get("TOP_K", "3"))
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
+# ─────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────
+HF_TOKEN       = os.environ.get("HF_TOKEN", "")
+MODEL_REPO     = os.environ.get("MODEL_REPO",   "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
+EMBED_MODEL    = os.environ.get("EMBED_MODEL",  "intfloat/multilingual-e5-base")
 
-SYSTEM_PROMPT = (
-    "तपाईं नेपलको एक वरिष्ठ कानूनी विशेषज्ञ हुनुहुन्छ। "
-    "प्रश्नको उत्तर दिँदा: "
-    "१) सम्बन्धित ऐन वा धारा उल्लेख गर्नुहोस्, "
-    "२) स्पष्ट र संक्षिप्त भाषामा व्याख्या गर्नुहोस्, " 
-    "३) व्यावहारिक उदाहरण दिनुहोस् यदि सम्भव भए। "
-    "उत्तर औपचारिक नेपाली कानूनी भाषामा दिनुहोस्।"
-)
+# FIX: index the real legal knowledge base, not the training/augmented set
+DATASET_NAME   = os.environ.get("DATASET_NAME", "chhatramani/Nepali_Legal_QA")
 
+INDEX_PATH     = os.environ.get("INDEX_PATH",   "./legal_faiss.index")
+DOCS_PATH      = os.environ.get("DOCS_PATH",    "./legal_docs.npy")
+
+TOP_K          = int(os.environ.get("TOP_K",          "5"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS",  "512"))
+HYDE_TOKENS    = int(os.environ.get("HYDE_TOKENS",     "200"))
+
+# ─────────────────────────────────────────────────────────────────
+# System prompt — must exactly match what was used during training.
+# The training notebook used this one sentence. Do not change this
+# until you retrain with a new prompt.
+# ─────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
+
+
+# ─────────────────────────────────────────────────────────────────
+# Shared state — filled at startup, read by request handlers
+# ─────────────────────────────────────────────────────────────────
 state: dict = {}
 
 
+def get_eos_ids(tokenizer):
+    """Token ids that should stop generation."""
+    ids    = [tokenizer.eos_token_id]
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if im_end and im_end != tokenizer.unk_token_id:
+        ids.append(im_end)
+    return ids
+
+
+def generate(messages: list, max_new_tokens: int) -> str:
+    """
+    Apply chat template, run the model, return the new text only.
+    Uses greedy decoding (do_sample=False) — most reliable for small models.
+    """
+    tokenizer = state["tokenizer"]
+    model     = state["model"]
+
+    prompt    = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs    = tokenizer(prompt, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens     = max_new_tokens,
+            do_sample          = False,   # greedy — no temperature needed
+            repetition_penalty = 1.15,    # stops the model from looping
+            eos_token_id       = get_eos_ids(tokenizer),
+            use_cache          = True,
+        )
+
+    new_tokens = output_ids[0][input_len:]
+    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+
+def hyde_retrieve(question: str, top_k: int):
+    """
+    Generate a hypothetical answer to use as the search query (HyDE),
+    then find the closest real documents in FAISS.
+    """
+    hyde_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": question.strip()},
+    ]
+    hypothetical_passage = generate(hyde_messages, max_new_tokens=HYDE_TOKENS)
+
+    query_emb = state["embedder"].encode(
+        [f"query: {hypothetical_passage}"],
+        normalize_embeddings=True,
+    ).astype("float32")
+
+    _, indices = state["index"].search(query_emb, top_k)
+    retrieved  = [state["docs"][i] for i in indices[0] if i < len(state["docs"])]
+
+    return hypothetical_passage, retrieved
+
+
+def rag_answer(question: str, top_k: int) -> dict:
+    """Full pipeline: HyDE retrieval → build context → generate answer."""
+
+    hypothetical_passage, retrieved_docs = hyde_retrieve(question, top_k)
+
+    # FIX: context injection format matches the training data format exactly.
+    # Training used: question + "\n\nसन्दर्भ (Context):\n" + context text
+    context_parts = []
+    for i, doc in enumerate(retrieved_docs):
+        context_parts.append(f"[सन्दर्भ {i + 1}]\n{doc}")
+    context_block = "\n\n".join(context_parts)
+
+    user_message = (
+        f"{question.strip()}\n\n"
+        f"सन्दर्भ (Context):\n{context_block}"
+    )
+
+    answer_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_message},
+    ]
+
+    final_answer = generate(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
+
+    return {
+        "question":       question,
+        "hyde_passage":   hypothetical_passage,
+        "retrieved_docs": retrieved_docs,
+        "answer":         final_answer,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Startup / Shutdown
+# ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("loading models")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"device: {device}")
 
-    log.info(f"loading embedder: {EMBED_MODEL}")
+    # Load embedding model
+    log.info(f"loading embedding model: {EMBED_MODEL}")
     state["embedder"] = SentenceTransformer(EMBED_MODEL, device=device)
     embed_dim = state["embedder"].get_sentence_embedding_dimension()
-    log.info(f"embedder ready dim={embed_dim}")
+    log.info(f"embedder ready  dim={embed_dim}")
 
-    log.info(f"loading slm: {MODEL_REPO}")
-    tok_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
+    # Load language model
+    log.info(f"loading language model: {MODEL_REPO}")
+    hf_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
 
-    state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_REPO, **tok_kwargs)
+    state["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_REPO, **hf_kwargs)
+
     if device == "cuda":
         state["model"] = AutoModelForCausalLM.from_pretrained(
             MODEL_REPO,
             torch_dtype=torch.float16,
             device_map="auto",
-            **tok_kwargs,
+            **hf_kwargs,
         )
     else:
         state["model"] = AutoModelForCausalLM.from_pretrained(
             MODEL_REPO,
             torch_dtype=torch.float32,
             device_map={"": "cpu"},
-            **tok_kwargs,
+            **hf_kwargs,
         )
-    state["model"].eval()
-    log.info("slm ready")
 
+    state["model"].eval()
+    log.info("language model ready")
+
+    # Load or build FAISS index
     if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH):
-        log.info("loading existing faiss index from disk")
+        log.info("loading existing faiss index")
         state["index"] = faiss.read_index(INDEX_PATH)
-        state["docs"] = np.load(DOCS_PATH, allow_pickle=True).tolist()
-        log.info(f"index loaded {state['index'].ntotal} vectors")
+        state["docs"]  = np.load(DOCS_PATH, allow_pickle=True).tolist()
+        log.info(f"index loaded — {state['index'].ntotal} vectors")
     else:
-        log.info("building faiss index from dataset")
+        log.info(f"building faiss index from: {DATASET_NAME}")
         from datasets import load_dataset
-        ds = load_dataset(DATASET_NAME, split="train")
+
+        ds   = load_dataset(DATASET_NAME, split="train")
         docs = []
+
         for row in ds:
             instruction = str(row.get("instruction", "")).strip()
-            output      = str(row.get("output", "")).strip()
-            context     = str(row.get("input", "")).strip()
-            passage     = instruction
-            if context and context.lower() != "nan":
-                passage += f"\n{context}"
-            passage += f"\n{output}"
+            output      = str(row.get("output",      "")).strip()
+            source      = str(row.get("source",      "")).strip()
+
+            # Include source law name in the passage so retrieval is law-aware
+            passage = ""
+            if source and source.lower() != "nan":
+                passage += f"स्रोत: {source}\n"
+            passage += instruction
+            if output and output.lower() != "nan":
+                passage += "\n" + output
+
             docs.append(passage)
 
         log.info(f"embedding {len(docs)} passages")
-        BATCH = 64
+
+        BATCH    = 64
         all_embs = []
+
         for i in range(0, len(docs), BATCH):
-            batch   = docs[i : i + BATCH]
+            batch    = docs[i : i + BATCH]
             prefixed = [f"passage: {d}" for d in batch]
-            embs = state["embedder"].encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
+            embs     = state["embedder"].encode(
+                prefixed, normalize_embeddings=True, show_progress_bar=False
+            )
             all_embs.append(embs)
             if i % (BATCH * 10) == 0:
-                log.info(f"embedded {min(i + BATCH, len(docs))} / {len(docs)}")
+                log.info(f"  embedded {min(i + BATCH, len(docs))} / {len(docs)}")
 
-        embeddings = np.vstack(all_embs).astype("float32")
+        embeddings     = np.vstack(all_embs).astype("float32")
         state["index"] = faiss.IndexFlatIP(embed_dim)
         state["index"].add(embeddings)
-        state["docs"] = docs
+        state["docs"]  = docs
 
         faiss.write_index(state["index"], INDEX_PATH)
         np.save(DOCS_PATH, np.array(docs, dtype=object))
-        log.info(f"faiss index built and saved {state['index'].ntotal} vectors")
+        log.info(f"index saved — {state['index'].ntotal} vectors")
 
-    log.info("all models ready api is live")
+    log.info("startup complete — api is live")
     yield
     log.info("shutting down")
 
 
-app = FastAPI(title="Nepali Legal QA API", version="1.0.0", lifespan=lifespan)
+# ─────────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────────
+app = FastAPI(title="Nepali Legal QA", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,77 +262,29 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    question: str
-    hyde_passage: str
-    retrieved_docs: List[str]
-    answer: str
+    question:        str
+    hyde_passage:    str
+    retrieved_docs:  List[str]
+    answer:          str
     processing_time: float
 
 
 class HealthResponse(BaseModel):
-    status: str
-    model: str
+    status:     str
+    model:      str
     index_size: int
-    device: str
-
-
-def _terminators():
-    tok = state["tokenizer"]
-    ids = [tok.eos_token_id]
-    im_end = tok.convert_tokens_to_ids("<|im_end|>")
-    if im_end and im_end != tok.unk_token_id:
-        ids.append(im_end)
-    return ids
-
-
-def generate_text(messages: list, max_new_tokens: int = MAX_NEW_TOKENS) -> str:
-    tok   = state["tokenizer"]
-    mdl   = state["model"]
-    prompt    = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs    = tok(prompt, return_tensors="pt").to(mdl.device)
-    input_len = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        output_ids = mdl.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=0.01,
-            do_sample=True,
-            top_p=0.95,
-            repetition_penalty=1.2,
-            eos_token_id=_terminators(),
-            use_cache=True,
-        )
-
-    new_tokens = output_ids[0][input_len:]
-    return tok.decode(new_tokens, skip_special_tokens=True).strip()
-
-
-def hyde_retrieve(question: str, top_k: int) -> tuple[str, list[str]]:
-    hyde_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": question.strip()},
-    ]
-    hypothetical = generate_text(hyde_messages, max_new_tokens=256)
-
-    query_emb = state["embedder"].encode(
-        [f"query: {hypothetical}"],
-        normalize_embeddings=True,
-    ).astype("float32")
-
-    _, indices = state["index"].search(query_emb, top_k)
-    retrieved  = [state["docs"][i] for i in indices[0] if i < len(state["docs"])]
-    return hypothetical, retrieved
+    device:     str
 
 
 @app.get("/api/health", response_model=HealthResponse)
 def health():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    index  = state.get("index")
     return HealthResponse(
-        status="ok",
-        model=MODEL_REPO,
-        index_size=state.get("index", faiss.IndexFlatIP(1)).ntotal,
-        device=device,
+        status     = "ok",
+        model      = MODEL_REPO,
+        index_size = index.ntotal if index else 0,
+        device     = device,
     )
 
 
@@ -213,29 +294,18 @@ def query(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     t0 = time.time()
-    log.info(f"query: {req.question[:80]}")
+    log.info(f"query: {req.question[:100]}")
 
-    hyde_passage, retrieved_docs = hyde_retrieve(req.question, top_k=req.top_k)
-    context_block = "\n\n---\n\n".join(
-        [f"[सन्दर्भ {i+1}]\n{doc}" for i, doc in enumerate(retrieved_docs)]
-    )
-    answer_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": (
-            f"{req.question.strip()}"
-            f"\n\nतलका कानूनी सन्दर्भहरूको आधारमा विस्तृत उत्तर दिनुहोस्:\n\n{context_block}"
-        )},
-    ]
-    answer = generate_text(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
+    result  = rag_answer(req.question, top_k=req.top_k)
     elapsed = round(time.time() - t0, 2)
-    log.info(f"answer generated in {elapsed}s")
+    log.info(f"done in {elapsed}s")
 
     return QueryResponse(
-        question=req.question,
-        hyde_passage=hyde_passage,
-        retrieved_docs=retrieved_docs,
-        answer=answer,
-        processing_time=elapsed,
+        question        = result["question"],
+        hyde_passage    = result["hyde_passage"],
+        retrieved_docs  = result["retrieved_docs"],
+        answer          = result["answer"],
+        processing_time = elapsed,
     )
 
 
