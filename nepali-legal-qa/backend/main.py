@@ -39,16 +39,16 @@ log = logging.getLogger(__name__)
 HF_TOKEN        = os.environ.get("HF_TOKEN", "")
 MODEL_REPO      = os.environ.get("MODEL_REPO",   "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
 EMBED_MODEL     = os.environ.get("EMBED_MODEL",  "intfloat/multilingual-e5-base")
-DATASET_NAME    = os.environ.get("DATASET_NAME", "chhatramani/Nepali_Legal_QA")
+DATASET_NAME    = os.environ.get("DATASET_NAME", "zeri000/augmented_nepali_legal_qa.csv")
 
 INDEX_PATH      = os.environ.get("INDEX_PATH",  "./legal_faiss.index")
 DOCS_PATH       = os.environ.get("DOCS_PATH",   "./legal_docs.npy")
 
 TOP_K           = int(os.environ.get("TOP_K",          "5"))
 MAX_NEW_TOKENS  = int(os.environ.get("MAX_NEW_TOKENS",  "512"))
-HYDE_TOKENS     = int(os.environ.get("HYDE_TOKENS",     "200"))
+HYDE_TOKENS     = int(os.environ.get("HYDE_TOKENS",     "256"))
 
-# Must exactly match what was used during training
+# Must exactly match what was used during training / notebooks
 SYSTEM_PROMPT   = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
 
 # Thread pool for running blocking inference without stalling the event loop
@@ -86,45 +86,11 @@ def _get_eos_ids(tokenizer) -> List[int]:
     return ids
 
 
-def _generate_greedy(messages: list, max_new_tokens: int) -> str:
-    """
-    Greedy (deterministic) generation — used for the final RAG answer
-    where we want a stable, factual response.
-    """
-    tokenizer  = state["tokenizer"]
-    model      = state["model"]
-    eos_ids    = _get_eos_ids(tokenizer)
+def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
+    """Shared generation helper matching the notebook RAG code.
 
-    prompt     = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs     = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len  = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens       = max_new_tokens,
-            do_sample            = False,           # greedy
-            repetition_penalty   = 1.3,
-            no_repeat_ngram_size = 4,
-            eos_token_id         = eos_ids,
-            use_cache            = True,
-        )
-
-    new_tokens = output_ids[0][input_len:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-
-def _generate_hyde(messages: list, max_new_tokens: int) -> str:
-    """
-    FIX 4: HyDE passage generation MUST use sampling so the hypothetical
-    document is diverse enough to retrieve relevant passages.  The original
-    code used the same greedy `generate()` for both HyDE and the final
-    answer — that kills HyDE retrieval quality.
-
-    Parameters match the notebook's inference test cell exactly:
-        temperature=0.01, do_sample=True, top_p=0.95
+    Used for both HyDE passage generation and the final answer:
+    temperature=0.01, do_sample=True, top_p=0.95, repetition_penalty=1.2.
     """
     tokenizer  = state["tokenizer"]
     model      = state["model"]
@@ -140,10 +106,10 @@ def _generate_hyde(messages: list, max_new_tokens: int) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens     = max_new_tokens,
+            temperature        = 0.01,
             do_sample          = True,
-            temperature        = 0.01,       # matches notebook inference cell
             top_p              = 0.95,
-            repetition_penalty = 1.0,
+            repetition_penalty = 1.2,
             eos_token_id       = eos_ids,
             use_cache          = True,
         )
@@ -157,7 +123,7 @@ def _hyde_retrieve(question: str, top_k: int):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": question.strip()},
     ]
-    hypothetical_passage = _generate_hyde(hyde_messages, max_new_tokens=HYDE_TOKENS)
+    hypothetical_passage = _generate_with_slm(hyde_messages, max_new_tokens=HYDE_TOKENS)
 
     # E5 convention: "query:" prefix for the search query (asymmetric retrieval)
     query_emb = state["embedder"].encode(
@@ -172,25 +138,27 @@ def _hyde_retrieve(question: str, top_k: int):
 
 
 def _rag_answer(question: str, top_k: int) -> dict:
+    """Run full HyDE + RAG and return structured result.
+
+    Mirrors the `rag_answer` implementation from nepali_legal_rag.ipynb
+    so backend behaviour matches the notebook exactly.
+    """
     hypothetical_passage, retrieved_docs = _hyde_retrieve(question, top_k)
 
-    context_parts = [
-        f"[सन्दर्भ {i + 1}]\n{doc}"
-        for i, doc in enumerate(retrieved_docs)
-    ]
-    context_block = "\n\n".join(context_parts)
-
-    user_message = (
-        f"{question.strip()}\n\n"
-        f"सन्दर्भ (Context):\n{context_block}"
+    context_block = "\n\n---\n\n".join(
+        [f"[सन्दर्भ {i + 1}]\n{doc}" for i, doc in enumerate(retrieved_docs)]
     )
 
     answer_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": user_message},
+        {"role": "user",   "content": (
+            f"{question.strip()}"  # question
+            "\n\nतलका कानूनी सन्दर्भहरूको आधारमा विस्तृत उत्तर दिनुहोस्:\n\n"
+            f"{context_block}"
+        )},
     ]
 
-    final_answer = _generate_greedy(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
+    final_answer = _generate_with_slm(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
 
     return {
         "question":       question,
@@ -210,16 +178,16 @@ def _build_index(embedder, embed_dim: int):
     ds   = load_dataset(DATASET_NAME, split="train")
     docs = []
 
+    # Mirror the passage construction from nepali_legal_rag.ipynb
     for row in ds:
         instruction = str(row.get("instruction", "")).strip()
         output      = str(row.get("output",      "")).strip()
-        source      = str(row.get("source",      "")).strip()
+        context     = str(row.get("input",       "")).strip()
 
-        passage = ""
-        if source and source.lower() != "nan":
-            passage += f"स्रोत: {source}\n"
-        passage += instruction
-        if output and output.lower() != "nan":
+        passage = instruction
+        if context:
+            passage += "\n" + context
+        if output:
             passage += "\n" + output
 
         docs.append(passage)
