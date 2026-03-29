@@ -30,8 +30,6 @@ log = logging.getLogger(__name__)
 HF_TOKEN       = os.environ.get("HF_TOKEN", "")
 MODEL_REPO     = os.environ.get("MODEL_REPO",   "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
 EMBED_MODEL    = os.environ.get("EMBED_MODEL",  "intfloat/multilingual-e5-base")
-
-# FIX: index the real legal knowledge base, not the training/augmented set
 DATASET_NAME   = os.environ.get("DATASET_NAME", "chhatramani/Nepali_Legal_QA")
 
 INDEX_PATH     = os.environ.get("INDEX_PATH",   "./legal_faiss.index")
@@ -41,22 +39,17 @@ TOP_K          = int(os.environ.get("TOP_K",          "5"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS",  "512"))
 HYDE_TOKENS    = int(os.environ.get("HYDE_TOKENS",     "200"))
 
-# ─────────────────────────────────────────────────────────────────
-# System prompt — must exactly match what was used during training.
-# The training notebook used this one sentence. Do not change this
-# until you retrain with a new prompt.
-# ─────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
+# Must exactly match what was used during training
+SYSTEM_PROMPT  = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
 
 
 # ─────────────────────────────────────────────────────────────────
-# Shared state — filled at startup, read by request handlers
+# Shared state
 # ─────────────────────────────────────────────────────────────────
 state: dict = {}
 
 
 def get_eos_ids(tokenizer):
-    """Token ids that should stop generation."""
     ids    = [tokenizer.eos_token_id]
     im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
     if im_end and im_end != tokenizer.unk_token_id:
@@ -65,10 +58,6 @@ def get_eos_ids(tokenizer):
 
 
 def generate(messages: list, max_new_tokens: int) -> str:
-    """
-    Apply chat template, run the model, return the new text only.
-    Uses greedy decoding (do_sample=False) — most reliable for small models.
-    """
     tokenizer = state["tokenizer"]
     model     = state["model"]
 
@@ -81,11 +70,12 @@ def generate(messages: list, max_new_tokens: int) -> str:
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens     = max_new_tokens,
-            do_sample          = False,   # greedy — no temperature needed
-            repetition_penalty = 1.15,    # stops the model from looping
-            eos_token_id       = get_eos_ids(tokenizer),
-            use_cache          = True,
+            max_new_tokens       = max_new_tokens,
+            do_sample            = False,  # greedy decoding — most stable for small models
+            repetition_penalty   = 1.3,    # higher value stops repetition loops
+            no_repeat_ngram_size = 4,      # blocks any 4-word phrase from repeating
+            eos_token_id         = get_eos_ids(tokenizer),
+            use_cache            = True,
         )
 
     new_tokens = output_ids[0][input_len:]
@@ -93,10 +83,6 @@ def generate(messages: list, max_new_tokens: int) -> str:
 
 
 def hyde_retrieve(question: str, top_k: int):
-    """
-    Generate a hypothetical answer to use as the search query (HyDE),
-    then find the closest real documents in FAISS.
-    """
     hyde_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": question.strip()},
@@ -115,12 +101,8 @@ def hyde_retrieve(question: str, top_k: int):
 
 
 def rag_answer(question: str, top_k: int) -> dict:
-    """Full pipeline: HyDE retrieval → build context → generate answer."""
-
     hypothetical_passage, retrieved_docs = hyde_retrieve(question, top_k)
 
-    # FIX: context injection format matches the training data format exactly.
-    # Training used: question + "\n\nसन्दर्भ (Context):\n" + context text
     context_parts = []
     for i, doc in enumerate(retrieved_docs):
         context_parts.append(f"[सन्दर्भ {i + 1}]\n{doc}")
@@ -155,6 +137,13 @@ async def lifespan(app: FastAPI):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"device: {device}")
 
+    # Always delete old index files so they rebuild from the correct dataset.
+    # Colab caches files on disk between runs which caused wrong results before.
+    for old_file in [INDEX_PATH, DOCS_PATH]:
+        if os.path.exists(old_file):
+            os.remove(old_file)
+            log.info(f"deleted old index file: {old_file}")
+
     # Load embedding model
     log.info(f"loading embedding model: {EMBED_MODEL}")
     state["embedder"] = SentenceTransformer(EMBED_MODEL, device=device)
@@ -185,57 +174,50 @@ async def lifespan(app: FastAPI):
     state["model"].eval()
     log.info("language model ready")
 
-    # Load or build FAISS index
-    if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH):
-        log.info("loading existing faiss index")
-        state["index"] = faiss.read_index(INDEX_PATH)
-        state["docs"]  = np.load(DOCS_PATH, allow_pickle=True).tolist()
-        log.info(f"index loaded — {state['index'].ntotal} vectors")
-    else:
-        log.info(f"building faiss index from: {DATASET_NAME}")
-        from datasets import load_dataset
+    # Build FAISS index from the correct dataset
+    log.info(f"building faiss index from: {DATASET_NAME}")
+    from datasets import load_dataset
 
-        ds   = load_dataset(DATASET_NAME, split="train")
-        docs = []
+    ds   = load_dataset(DATASET_NAME, split="train")
+    docs = []
 
-        for row in ds:
-            instruction = str(row.get("instruction", "")).strip()
-            output      = str(row.get("output",      "")).strip()
-            source      = str(row.get("source",      "")).strip()
+    for row in ds:
+        instruction = str(row.get("instruction", "")).strip()
+        output      = str(row.get("output",      "")).strip()
+        source      = str(row.get("source",      "")).strip()
 
-            # Include source law name in the passage so retrieval is law-aware
-            passage = ""
-            if source and source.lower() != "nan":
-                passage += f"स्रोत: {source}\n"
-            passage += instruction
-            if output and output.lower() != "nan":
-                passage += "\n" + output
+        passage = ""
+        if source and source.lower() != "nan":
+            passage += f"स्रोत: {source}\n"
+        passage += instruction
+        if output and output.lower() != "nan":
+            passage += "\n" + output
 
-            docs.append(passage)
+        docs.append(passage)
 
-        log.info(f"embedding {len(docs)} passages")
+    log.info(f"embedding {len(docs)} passages — takes a few minutes")
 
-        BATCH    = 64
-        all_embs = []
+    BATCH    = 64
+    all_embs = []
 
-        for i in range(0, len(docs), BATCH):
-            batch    = docs[i : i + BATCH]
-            prefixed = [f"passage: {d}" for d in batch]
-            embs     = state["embedder"].encode(
-                prefixed, normalize_embeddings=True, show_progress_bar=False
-            )
-            all_embs.append(embs)
-            if i % (BATCH * 10) == 0:
-                log.info(f"  embedded {min(i + BATCH, len(docs))} / {len(docs)}")
+    for i in range(0, len(docs), BATCH):
+        batch    = docs[i : i + BATCH]
+        prefixed = [f"passage: {d}" for d in batch]
+        embs     = state["embedder"].encode(
+            prefixed, normalize_embeddings=True, show_progress_bar=False
+        )
+        all_embs.append(embs)
+        if i % (BATCH * 10) == 0:
+            log.info(f"  embedded {min(i + BATCH, len(docs))} / {len(docs)}")
 
-        embeddings     = np.vstack(all_embs).astype("float32")
-        state["index"] = faiss.IndexFlatIP(embed_dim)
-        state["index"].add(embeddings)
-        state["docs"]  = docs
+    embeddings     = np.vstack(all_embs).astype("float32")
+    state["index"] = faiss.IndexFlatIP(embed_dim)
+    state["index"].add(embeddings)
+    state["docs"]  = docs
 
-        faiss.write_index(state["index"], INDEX_PATH)
-        np.save(DOCS_PATH, np.array(docs, dtype=object))
-        log.info(f"index saved — {state['index'].ntotal} vectors")
+    faiss.write_index(state["index"], INDEX_PATH)
+    np.save(DOCS_PATH, np.array(docs, dtype=object))
+    log.info(f"index ready — {state['index'].ntotal} vectors")
 
     log.info("startup complete — api is live")
     yield
@@ -245,7 +227,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="Nepali Legal QA", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Nepali Legal QA", version="1.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
