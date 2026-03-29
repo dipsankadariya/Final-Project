@@ -5,7 +5,10 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 async function queryLegal(question, topK = 5) {
   const res = await fetch(`${API_BASE}/api/query`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'ngrok-skip-browser-warning': 'true',
+    },
     body: JSON.stringify({ question, top_k: topK }),
   })
   if (!res.ok) {
