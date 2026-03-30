@@ -31,11 +31,37 @@ DATASET_NAME    = os.environ.get("DATASET_NAME", "zeri000/augmented_nepali_legal
 INDEX_PATH      = os.environ.get("INDEX_PATH",  "./legal_faiss.index")
 DOCS_PATH       = os.environ.get("DOCS_PATH",   "./legal_docs.npy")
 
-TOP_K           = int(os.environ.get("TOP_K",          "5"))
-MAX_NEW_TOKENS  = int(os.environ.get("MAX_NEW_TOKENS",  "512"))
-HYDE_TOKENS     = int(os.environ.get("HYDE_TOKENS",     "256"))
+TOP_K           = int(os.environ.get("TOP_K",          "7"))
+MAX_NEW_TOKENS  = int(os.environ.get("MAX_NEW_TOKENS",  "768"))
+HYDE_TOKENS     = int(os.environ.get("HYDE_TOKENS",     "192"))
 
-SYSTEM_PROMPT   = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
+# ── Retrieval tuning ──────────────────────────────────────────────
+HYDE_WEIGHT     = float(os.environ.get("HYDE_WEIGHT",   "0.6"))   # weight for HyDE embedding
+QUERY_WEIGHT    = float(os.environ.get("QUERY_WEIGHT",  "0.4"))   # weight for original question embedding
+MIN_SIMILARITY  = float(os.environ.get("MIN_SIMILARITY","0.40"))  # drop passages below this score
+
+# ── Enhanced system prompt ────────────────────────────────────────
+# Bilingual so the model fully understands the instructions.
+# Tells the model HOW to answer, not just WHAT it is.
+SYSTEM_PROMPT = (
+    "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ। "
+    "तपाईंले प्रयोगकर्ताको प्रश्नको उत्तर दिनुपर्छ।\n\n"
+    "नियमहरू:\n"
+    "1. उत्तर सधैं प्रदान गरिएको सन्दर्भ (context) मा आधारित हुनुपर्छ।\n"
+    "2. सन्दर्भमा नभएको कुरा नथप्नुहोस् — तथ्यमा मात्र आधारित रहनुहोस्।\n"
+    "3. सम्बन्धित ऐन, धारा, नियम वा दफाको नाम उल्लेख गर्नुहोस्।\n"
+    "4. उत्तर स्पष्ट, विस्तृत र क्रमबद्ध (point-wise) दिनुहोस्।\n"
+    "5. यदि सन्दर्भमा पर्याप्त जानकारी छैन भने स्पष्ट रूपमा भन्नुहोस्।\n"
+    "6. नेपालीमा उत्तर दिनुहोस्।"
+)
+
+# ── Prompt used only for HyDE passage generation ─────────────────
+# This is intentionally simpler — we just need a rough passage.
+HYDE_SYSTEM_PROMPT = (
+    "तपाईं एक नेपाली कानूनी विशेषज्ञ हुनुहुन्छ। "
+    "प्रयोगकर्ताको प्रश्नको सम्भावित उत्तर एक छोटो अनुच्छेदमा लेख्नुहोस्। "
+    "सम्बन्धित ऐन वा नियमको नाम समावेश गर्नुहोस्।"
+)
 
 _executor = ThreadPoolExecutor(max_workers=1)
 state: dict = {}
@@ -57,7 +83,7 @@ def _get_eos_ids(tokenizer) -> List[int]:
 
 
 def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
-    
+    """Generate text using the finetuned SLM with greedy decoding."""
     tokenizer  = state["tokenizer"]
     model      = state["model"]
     eos_ids    = _get_eos_ids(tokenizer)
@@ -72,10 +98,8 @@ def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
         output_ids = model.generate(
             **inputs,
             max_new_tokens     = max_new_tokens,
-            temperature        = 0.01,
-            do_sample          = True,
-            top_p              = 0.95,
-            repetition_penalty = 1.2,
+            do_sample          = False,        # greedy — factually more accurate
+            repetition_penalty = 1.15,         # mild penalty to prevent loops
             eos_token_id       = eos_ids,
             use_cache          = True,
         )
@@ -85,42 +109,95 @@ def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
 
 
 def _hyde_retrieve(question: str, top_k: int):
+    """
+    Hybrid HyDE retrieval:
+    1. Generate a hypothetical passage using the SLM
+    2. Embed BOTH the original question AND the hypothetical passage
+    3. Use a weighted average of both embeddings for FAISS search
+    4. Filter results by minimum similarity score
+    """
+    # Step 1: Generate HyDE passage with the simpler prompt
     hyde_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": HYDE_SYSTEM_PROMPT},
         {"role": "user",   "content": question.strip()},
     ]
     hypothetical_passage = _generate_with_slm(hyde_messages, max_new_tokens=HYDE_TOKENS)
+    log.info(f"hyde passage ({len(hypothetical_passage)} chars): {hypothetical_passage[:120]}...")
 
-    query_emb = state["embedder"].encode(
+    # Step 2: Embed both the original question AND the HyDE passage
+    embedder = state["embedder"]
+
+    query_emb = embedder.encode(
+        [f"query: {question.strip()}"],
+        normalize_embeddings=True,
+    ).astype("float32")
+
+    hyde_emb = embedder.encode(
         [f"query: {hypothetical_passage}"],
         normalize_embeddings=True,
     ).astype("float32")
 
-    _, indices = state["index"].search(query_emb, top_k)
-    docs       = state["docs"]
-    retrieved  = [docs[i] for i in indices[0] if i < len(docs)]
+    # Step 3: Weighted average — blend original question with HyDE passage
+    # This makes retrieval robust even when HyDE output is poor
+    combined_emb = (QUERY_WEIGHT * query_emb + HYDE_WEIGHT * hyde_emb)
+    # Re-normalize after averaging
+    norm = np.linalg.norm(combined_emb, axis=1, keepdims=True)
+    combined_emb = (combined_emb / norm).astype("float32")
+
+    # Step 4: Search FAISS with the blended embedding
+    scores, indices = state["index"].search(combined_emb, top_k)
+
+    # Step 5: Filter by minimum similarity score
+    docs = state["docs"]
+    retrieved = []
+    for score, idx in zip(scores[0], indices[0]):
+        if idx < len(docs) and score >= MIN_SIMILARITY:
+            retrieved.append(docs[idx])
+            log.info(f"  doc {idx}: score={score:.4f} (accepted)")
+        elif idx < len(docs):
+            log.info(f"  doc {idx}: score={score:.4f} (rejected, below {MIN_SIMILARITY})")
+
+    # Guarantee at least 1 result even if scores are low
+    if not retrieved and indices[0][0] < len(docs):
+        retrieved.append(docs[indices[0][0]])
+        log.warning(f"  forced top-1 doc (score={scores[0][0]:.4f}) since all below threshold")
+
     return hypothetical_passage, retrieved
 
 
 def _rag_answer(question: str, top_k: int) -> dict:
     """Run full HyDE + RAG and return structured result.
 
-    Mirrors the `rag_answer` implementation from nepali_legal_rag.ipynb
-    so backend behaviour matches the notebook exactly.
+    Improvements over original:
+    - Hybrid query-HyDE retrieval for robust document matching
+    - Structured RAG prompt that forces grounded, cited answers
+    - Similarity filtering to exclude irrelevant passages
     """
     hypothetical_passage, retrieved_docs = _hyde_retrieve(question, top_k)
 
+    # Build a clearly structured context block
     context_block = "\n\n---\n\n".join(
         [f"[सन्दर्भ {i + 1}]\n{doc}" for i, doc in enumerate(retrieved_docs)]
     )
 
+    # ── Improved RAG answer prompt ────────────────────────────────
+    # Explicit grounding instructions + structured output request
+    user_prompt = (
+        f"प्रश्न: {question.strip()}\n\n"
+        f"तल {len(retrieved_docs)} वटा कानूनी सन्दर्भहरू दिइएका छन्। "
+        "यी सन्दर्भहरूमा आधारित भएर मात्र उत्तर दिनुहोस्।\n\n"
+        "निर्देशनहरू:\n"
+        "- सन्दर्भमा उल्लेख भएका ऐन, धारा, दफा वा नियमको नाम स्पष्ट रूपमा उल्लेख गर्नुहोस्।\n"
+        "- उत्तर क्रमबद्ध (point-wise) र विस्तृत दिनुहोस्।\n"
+        "- सन्दर्भमा नभएको कुरा नथप्नुहोस्।\n"
+        "- यदि सन्दर्भमा पर्याप्त जानकारी छैन भने यो कुरा स्पष्ट पार्नुहोस्।\n\n"
+        f"सन्दर्भहरू:\n\n{context_block}\n\n"
+        "माथिका सन्दर्भहरूमा आधारित उत्तर:"
+    )
+
     answer_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": (
-            f"{question.strip()}"
-            "\n\nतलका कानूनी सन्दर्भहरूको आधारमा विस्तृत उत्तर दिनुहोस्:\n\n"
-            f"{context_block}"
-        )},
+        {"role": "user",   "content": user_prompt},
     ]
 
     final_answer = _generate_with_slm(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
@@ -131,6 +208,7 @@ def _rag_answer(question: str, top_k: int) -> dict:
         "retrieved_docs": retrieved_docs,
         "answer":         final_answer,
     }
+
 def _build_index(embedder, embed_dim: int):
     log.info(f"building faiss index from dataset: {DATASET_NAME}")
     ds   = load_dataset(DATASET_NAME, split="train")
@@ -219,12 +297,12 @@ async def lifespan(app: FastAPI):
     state["index"]     = index
     state["docs"]      = docs
 
-    log.info("startup complete — api is live")
+    log.info(f"startup complete — api is live  (top_k={TOP_K}, max_tokens={MAX_NEW_TOKENS}, hyde_weight={HYDE_WEIGHT}, min_sim={MIN_SIMILARITY})")
     yield
     log.info("shutting down")
 
 
-app = FastAPI(title="Nepali Legal QA", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Nepali Legal QA", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -284,7 +362,7 @@ async def query(req: QueryRequest):
     )
 
     elapsed = round(time.time() - t0, 2)
-    log.info(f"done in {elapsed}s")
+    log.info(f"done in {elapsed}s — answer length: {len(result['answer'])} chars")
 
     return QueryResponse(
         question        = result["question"],
