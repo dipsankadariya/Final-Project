@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-// For dev, always call relative /api and let Vite proxy
-const API_BASE = ''
+// Use absolute API base (Colab URL) provided via VITE_API_BASE
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
 async function queryLegal(question, topK = 5) {
   const res = await fetch(`${API_BASE}/api/query`, {

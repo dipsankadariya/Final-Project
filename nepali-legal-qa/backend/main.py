@@ -300,8 +300,9 @@ app = FastAPI(title="Nepali Legal QA", version="2.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
+    # Allow any origin; we don't use cookies, so credentials can be disabled.
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
