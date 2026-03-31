@@ -24,9 +24,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 HF_TOKEN        = os.environ.get("HF_TOKEN", "")
-MODEL_REPO      = os.environ.get("MODEL_REPO",   "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
-EMBED_MODEL     = os.environ.get("EMBED_MODEL",  "intfloat/multilingual-e5-base")
-DATASET_NAME    = os.environ.get("DATASET_NAME", "zeri000/augmented_nepali_legal_qa.csv")
+MODEL_REPO      = os.environ.get("MODEL_REPO",      "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
+BASE_MODEL_REPO = os.environ.get("BASE_MODEL_REPO", "unsloth/Qwen2.5-1.5B-Instruct")
+EMBED_MODEL     = os.environ.get("EMBED_MODEL",     "intfloat/multilingual-e5-base")
+DATASET_NAME    = os.environ.get("DATASET_NAME",    "zeri000/augmented_nepali_legal_qa.csv")
 
 INDEX_PATH      = os.environ.get("INDEX_PATH",  "./legal_faiss.index")
 DOCS_PATH       = os.environ.get("DOCS_PATH",   "./legal_docs.npy")
@@ -46,6 +47,16 @@ SYSTEM_PROMPT   = "तपाईं एक विशेषज्ञ नेपा�
 _executor = ThreadPoolExecutor(max_workers=1)
 state: dict = {}
 
+
+def _get_model_and_tokenizer(kind: str = "finetuned"):
+    """Return (model, tokenizer) pair for either base or fine-tuned SLM.
+
+    kind: "base" | "finetuned" (default)
+    """
+    if kind == "base":
+        return state["base_model"], state["base_tokenizer"]
+    return state["model"], state["tokenizer"]
+
 def _get_eos_ids(tokenizer) -> List[int]:
     ids = []
     if tokenizer.eos_token_id is not None:
@@ -62,10 +73,9 @@ def _get_eos_ids(tokenizer) -> List[int]:
     return ids
 
 
-def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
+def _generate_with_slm(messages: list, max_new_tokens: int, kind: str = "finetuned") -> str:
     """Generate text — EXACT same params as original working version."""
-    tokenizer  = state["tokenizer"]
-    model      = state["model"]
+    model, tokenizer = _get_model_and_tokenizer(kind)
     eos_ids    = _get_eos_ids(tokenizer)
 
     prompt     = tokenizer.apply_chat_template(
@@ -90,7 +100,7 @@ def _generate_with_slm(messages: list, max_new_tokens: int) -> str:
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
-def _hyde_retrieve(question: str, top_k: int):
+def _hyde_retrieve(question: str, top_k: int, kind: str = "finetuned"):
     """
     IMPROVED: Hybrid HyDE retrieval.
     Blends original question embedding (40%) with HyDE passage embedding (60%)
@@ -100,7 +110,11 @@ def _hyde_retrieve(question: str, top_k: int):
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": question.strip()},
     ]
-    hypothetical_passage = _generate_with_slm(hyde_messages, max_new_tokens=HYDE_TOKENS)
+    hypothetical_passage = _generate_with_slm(
+        hyde_messages,
+        max_new_tokens=HYDE_TOKENS,
+        kind=kind,
+    )
 
     # NEW: Embed both original question AND HyDE passage
     embedder = state["embedder"]
@@ -137,9 +151,9 @@ def _hyde_retrieve(question: str, top_k: int):
     return hypothetical_passage, retrieved
 
 
-def _rag_answer(question: str, top_k: int) -> dict:
+def _rag_answer(question: str, top_k: int, kind: str = "finetuned") -> dict:
     """Run full HyDE + RAG — same prompt format as original."""
-    hypothetical_passage, retrieved_docs = _hyde_retrieve(question, top_k)
+    hypothetical_passage, retrieved_docs = _hyde_retrieve(question, top_k, kind=kind)
 
     # SAME context format as original
     context_block = "\n\n---\n\n".join(
@@ -156,7 +170,11 @@ def _rag_answer(question: str, top_k: int) -> dict:
         )},
     ]
 
-    final_answer = _generate_with_slm(answer_messages, max_new_tokens=MAX_NEW_TOKENS)
+    final_answer = _generate_with_slm(
+        answer_messages,
+        max_new_tokens=MAX_NEW_TOKENS,
+        kind=kind,
+    )
 
     return {
         "question":       question,
@@ -233,7 +251,7 @@ async def lifespan(app: FastAPI):
     embed_dim         = state["embedder"].get_sentence_embedding_dimension()
     log.info(f"embedder ready  dim={embed_dim}")
 
-    log.info(f"loading language model: {MODEL_REPO}")
+    log.info(f"loading fine-tuned language model: {MODEL_REPO}")
     hf_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name     = MODEL_REPO,
@@ -247,7 +265,27 @@ async def lifespan(app: FastAPI):
 
     state["model"]     = model
     state["tokenizer"] = tokenizer
-    log.info("language model ready")
+    log.info("fine-tuned language model ready")
+
+    # Optional: separate base model for comparison mode
+    if BASE_MODEL_REPO:
+        try:
+            log.info(f"loading base language model: {BASE_MODEL_REPO}")
+            base_model, base_tokenizer = FastLanguageModel.from_pretrained(
+                model_name     = BASE_MODEL_REPO,
+                max_seq_length = 2048,
+                dtype          = None,
+                load_in_4bit   = True,
+                **hf_kwargs,
+            )
+            base_tokenizer = get_chat_template(base_tokenizer, chat_template="chatml")
+            FastLanguageModel.for_inference(base_model)
+
+            state["base_model"]     = base_model
+            state["base_tokenizer"] = base_tokenizer
+            log.info("base language model ready")
+        except Exception as exc:
+            log.warning(f"failed to load base model ({exc}) — comparison mode base endpoint will be unavailable")
 
     index, docs        = _load_or_build_index(state["embedder"], embed_dim)
     state["index"]     = index
@@ -293,6 +331,7 @@ class HealthResponse(BaseModel):
 def health():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     index  = state.get("index")
+    base_ok = "base_model" in state and "base_tokenizer" in state
     return HealthResponse(
         status     = "ok",
         model      = MODEL_REPO,
@@ -315,10 +354,47 @@ async def query(req: QueryRequest):
         _rag_answer,
         req.question,
         req.top_k,
+        "finetuned",
     )
 
     elapsed = round(time.time() - t0, 2)
     log.info(f"done in {elapsed}s")
+
+    return QueryResponse(
+        question        = result["question"],
+        hyde_passage    = result["hyde_passage"],
+        retrieved_docs  = result["retrieved_docs"],
+        answer          = result["answer"],
+        processing_time = elapsed,
+    )
+
+
+@app.post("/api/query_base", response_model=QueryResponse)
+async def query_base(req: QueryRequest):
+    """Same HyDE + RAG pipeline, but using the *base* SLM.
+
+    This is used only for comparison mode in the UI.
+    """
+    if "base_model" not in state or "base_tokenizer" not in state:
+        raise HTTPException(status_code=503, detail="Base model not loaded on server")
+
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+
+    t0 = time.time()
+    log.info(f"[base] query: {req.question[:100]}")
+
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        _executor,
+        _rag_answer,
+        req.question,
+        req.top_k,
+        "base",
+    )
+
+    elapsed = round(time.time() - t0, 2)
+    log.info(f"[base] done in {elapsed}s")
 
     return QueryResponse(
         question        = result["question"],

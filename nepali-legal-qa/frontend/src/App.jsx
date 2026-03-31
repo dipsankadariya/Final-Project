@@ -1,9 +1,26 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+// For dev, always call relative /api and let Vite proxy
+const API_BASE = ''
 
 async function queryLegal(question, topK = 5) {
   const res = await fetch(`${API_BASE}/api/query`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'ngrok-skip-browser-warning': 'true',
+    },
+    body: JSON.stringify({ question, top_k: topK }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail ?? `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+async function queryBase(question, topK = 5) {
+  const res = await fetch(`${API_BASE}/api/query_base`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -178,8 +195,10 @@ export default function App() {
   const [loading, setLoading]   = useState(false)
   const [phase, setPhase]       = useState('hyde')
   const [result, setResult]     = useState(null)
+  const [compare, setCompare]   = useState(null)
   const [error, setError]       = useState(null)
   const [history, setHistory]   = useState([])
+  const [mode, setMode]         = useState('single') // 'single' | 'compare'
   const textareaRef             = useRef(null)
   const resultsRef              = useRef(null)
 
@@ -194,13 +213,22 @@ export default function App() {
     const trimmed = q.trim()
     if (!trimmed || loading) return
     setQuestion(trimmed)
-    setLoading(true); setError(null); setResult(null); setPhase('hyde')
+    setLoading(true); setError(null); setResult(null); setCompare(null); setPhase('hyde')
     const t1 = setTimeout(() => setPhase('retrieve'), 3000)
     const t2 = setTimeout(() => setPhase('answer'), 7000)
     try {
-      const data = await queryLegal(trimmed)
+      let data
+      if (mode === 'single') {
+        data = await queryLegal(trimmed)
+        setResult(data)
+      } else {
+        const [baseRes, ftRes] = await Promise.all([
+          queryBase(trimmed),
+          queryLegal(trimmed),
+        ])
+        setCompare({ question: trimmed, base: baseRes, finetuned: ftRes })
+      }
       clearTimeout(t1); clearTimeout(t2)
-      setResult(data)
       setHistory(h => [{ question: trimmed, time: new Date().toLocaleTimeString() }, ...h].slice(0, 6))
       setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
     } catch (e) {
@@ -209,7 +237,7 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [question, loading])
+  }, [question, loading, mode])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit() }
@@ -285,7 +313,27 @@ export default function App() {
         <main className="space-y-4 min-w-0">
           <div className="bg-white rounded-2xl border border-purple-100 shadow-sm overflow-hidden">
             <div className="px-5 pt-5 pb-3">
-              <p className="text-[10px] font-bold tracking-widest uppercase text-gray-300 mb-3">Your Question</p>
+              <div className="flex items-center justify-between gap-3 mb-3">
+                <p className="text-[10px] font-bold tracking-widest uppercase text-gray-300">Your Question</p>
+                <div className="inline-flex items-center text-[10px] bg-gray-50 border border-purple-100 rounded-full p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => !loading && setMode('single')}
+                    className={`px-2.5 py-1 rounded-full font-semibold transition-colors ${mode === 'single' ? 'bg-purple-600 text-white shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}
+                    disabled={loading}
+                  >
+                    SLM + RAG
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => !loading && setMode('compare')}
+                    className={`px-2.5 py-1 rounded-full font-semibold transition-colors ${mode === 'compare' ? 'bg-purple-600 text-white shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}
+                    disabled={loading}
+                  >
+                    Comparison
+                  </button>
+                </div>
+              </div>
               <textarea
                 ref={textareaRef}
                 rows={1}
@@ -331,7 +379,7 @@ export default function App() {
 
           {loading && <LoadingView phase={phase} />}
 
-          {result && !loading && (
+          {mode === 'single' && result && !loading && (
             <div ref={resultsRef} className="space-y-3" style={{ animation: 'fadeUp 0.35s ease' }}>
               <div className="flex items-center justify-between px-1 py-1">
                 <p className="text-xs font-semibold text-gray-700">
@@ -343,6 +391,43 @@ export default function App() {
               <HydeCard passage={result.hyde_passage} />
               <DocsCard docs={result.retrieved_docs} />
               <AnswerCard answer={result.answer} />
+            </div>
+          )}
+
+          {mode === 'compare' && compare && !loading && (
+            <div ref={resultsRef} className="space-y-3" style={{ animation: 'fadeUp 0.35s ease' }}>
+              <div className="flex items-center justify-between px-1 py-1">
+                <p className="text-xs font-semibold text-gray-700">
+                  Comparison mode
+                  <span className="font-normal text-gray-400 ml-2 italic">"{compare.question.slice(0, 60)}{compare.question.length > 60 ? '…' : ''}"</span>
+                </p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between px-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-gray-900 text-white">Base LLM</span>
+                      <span className="text-[11px] text-gray-500">Qwen2.5 · no fine-tuning</span>
+                    </div>
+                    <span className="text-[11px] text-gray-400 font-mono flex-shrink-0">{compare.base.processing_time}s</span>
+                  </div>
+                  <HydeCard passage={compare.base.hyde_passage} />
+                  <DocsCard docs={compare.base.retrieved_docs} />
+                  <AnswerCard answer={compare.base.answer} />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between px-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-purple-600 text-white">Fine-tuned</span>
+                      <span className="text-[11px] text-gray-500">Qwen2.5 + HyDE + RAG</span>
+                    </div>
+                    <span className="text-[11px] text-gray-400 font-mono flex-shrink-0">{compare.finetuned.processing_time}s</span>
+                  </div>
+                  <HydeCard passage={compare.finetuned.hyde_passage} />
+                  <DocsCard docs={compare.finetuned.retrieved_docs} />
+                  <AnswerCard answer={compare.finetuned.answer} />
+                </div>
+              </div>
             </div>
           )}
 
