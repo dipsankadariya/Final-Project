@@ -4,7 +4,7 @@
 
 > **Note:** Any HuggingFace API keys visible in the notebooks were hardcoded for testing purposes only and have since been revoked. Do not use them.
 
-> This is an active research project. Results are preliminary and we're continuously working to improve them.
+> This is an active research project. Results are preliminary and we're continuously working to improve them...
 
 ---
 
