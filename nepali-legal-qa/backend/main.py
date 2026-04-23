@@ -146,16 +146,21 @@ def load_models():
         hf_dataset = load_dataset("zeri000/augmented_nepali_legal_qa.csv", split="train")
         log.info("Downloaded %d rows from HuggingFace", len(hf_dataset))
 
-        # Convert each Q&A row into a Document (question + answer as page_content)
-        chunks = [
-            Document(
-                page_content=f"प्रश्न: {row['question']}\nउत्तर: {row['answer']}",
-                metadata={"row": i},
-            )
-            for i, row in enumerate(hf_dataset)
-            if row.get("question") and row.get("answer")
-        ]
+        # Convert each Q&A row into a Document
+        # Dataset uses 'ground_truth' column (not 'answer')
+        chunks = []
+        for i, row in enumerate(hf_dataset):
+            question = row.get("question", "").strip()
+            # handle both column name variants
+            answer = (row.get("ground_truth") or row.get("answer") or "").strip()
+            if question and answer:
+                chunks.append(Document(
+                    page_content=f"प्रश्न: {question}\nउत्तर: {answer}",
+                    metadata={"row": i},
+                ))
         log.info("Built %d documents from dataset", len(chunks))
+        if not chunks:
+            raise RuntimeError("Dataset loaded but produced 0 documents — check column names")
 
     vector_store = FAISS.from_documents(chunks, embeddings)
     retriever    = vector_store.as_retriever(search_kwargs={"k": 3})
