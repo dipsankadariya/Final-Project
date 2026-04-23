@@ -146,21 +146,35 @@ def load_models():
         hf_dataset = load_dataset("zeri000/augmented_nepali_legal_qa.csv", split="train")
         log.info("Downloaded %d rows from HuggingFace", len(hf_dataset))
 
-        # Convert each Q&A row into a Document
-        # Dataset uses 'ground_truth' column (not 'answer')
+        # Dataset columns (confirmed from Ritesh_fine_tune notebook):
+        #   instruction = question / prompt
+        #   output      = answer
+        #   input       = optional context (may be empty)
+        log.info("Dataset columns: %s", hf_dataset.column_names)
         chunks = []
         for i, row in enumerate(hf_dataset):
-            question = row.get("question", "").strip()
-            # handle both column name variants
-            answer = (row.get("ground_truth") or row.get("answer") or "").strip()
-            if question and answer:
-                chunks.append(Document(
-                    page_content=f"प्रश्न: {question}\nउत्तर: {answer}",
-                    metadata={"row": i},
-                ))
+            instruction = row.get("instruction", "").strip()
+            output      = row.get("output", "").strip()
+            context     = row.get("input", "").strip()
+
+            if not instruction or not output:
+                continue
+
+            # Build page_content exactly like the fine-tuning format
+            user_text = instruction
+            if context:
+                user_text += f"\n\nसन्दर्भ (Context):\n{context}"
+
+            chunks.append(Document(
+                page_content=f"प्रश्न: {user_text}\nउत्तर: {output}",
+                metadata={"row": i},
+            ))
+
         log.info("Built %d documents from dataset", len(chunks))
         if not chunks:
-            raise RuntimeError("Dataset loaded but produced 0 documents — check column names")
+            raise RuntimeError(
+                f"Dataset produced 0 documents. Columns found: {hf_dataset.column_names}"
+            )
 
     vector_store = FAISS.from_documents(chunks, embeddings)
     retriever    = vector_store.as_retriever(search_kwargs={"k": 3})
