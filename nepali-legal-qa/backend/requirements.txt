@@ -1,11 +1,31 @@
+# ── FastAPI server ────────────────────────────────────────────────
 fastapi==0.115.5
-uvicorn==0.32.1
+uvicorn[standard]==0.32.1
 pydantic==2.10.3
+python-multipart==0.0.12
+
+# ── SLM inference (HyDE generation) ──────────────────────────────
+torch>=2.4.0
 transformers==4.56.2
-torch
-sentence-transformers
+accelerate>=1.2.0
+
+# ── LangChain stack (from nepali_rag_qa.ipynb) ───────────────────
+langchain
+langchain-groq
+langchain-huggingface
+langchain-community
+langchain-text-splitters
+
+# ── Vector store ──────────────────────────────────────────────────
 faiss-cpu
-numpy
-datasets
-accelerate
-unsloth
+
+# ── Embeddings — sentence-transformers/LaBSE ─────────────────────
+sentence-transformers>=3.3.0
+
+# ── HuggingFace dataset loading (corpus download) ─────────────────
+datasets>=3.1.0
+
+# ── Utilities ─────────────────────────────────────────────────────
+numpy>=1.26.0
+pyngrok
+python-dotenv>=1.0.0

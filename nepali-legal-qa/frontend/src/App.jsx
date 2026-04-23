@@ -1,30 +1,12 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-// Use absolute API base (Colab URL) provided via VITE_API_BASE
-const API_BASE = import.meta.env.VITE_API_BASE ?? ''
-
+// All /api/* requests are proxied to VITE_API_BASE by Vite (see vite.config.js).
+// Never set API_BASE here — always use relative paths so the proxy works.
 async function queryLegal(question, topK = 5) {
-  const res = await fetch(`${API_BASE}/api/query`, {
+  const res = await fetch('/api/query', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'ngrok-skip-browser-warning': 'true',
-    },
-    body: JSON.stringify({ question, top_k: topK }),
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}))
-    throw new Error(err.detail ?? `HTTP ${res.status}`)
-  }
-  return res.json()
-}
-
-async function queryBase(question, topK = 5) {
-  const res = await fetch(`${API_BASE}/api/query_base`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'ngrok-skip-browser-warning': 'true',
     },
     body: JSON.stringify({ question, top_k: topK }),
   })
@@ -195,12 +177,11 @@ export default function App() {
   const [loading, setLoading]   = useState(false)
   const [phase, setPhase]       = useState('hyde')
   const [result, setResult]     = useState(null)
-  const [compare, setCompare]   = useState(null)
   const [error, setError]       = useState(null)
   const [history, setHistory]   = useState([])
-  const [mode, setMode]         = useState('single') // 'single' | 'compare'
   const textareaRef             = useRef(null)
   const resultsRef              = useRef(null)
+  const mode = 'single'
 
   useEffect(() => {
     const ta = textareaRef.current
@@ -213,21 +194,12 @@ export default function App() {
     const trimmed = q.trim()
     if (!trimmed || loading) return
     setQuestion(trimmed)
-    setLoading(true); setError(null); setResult(null); setCompare(null); setPhase('hyde')
+    setLoading(true); setError(null); setResult(null); setPhase('hyde')
     const t1 = setTimeout(() => setPhase('retrieve'), 3000)
     const t2 = setTimeout(() => setPhase('answer'), 7000)
     try {
-      let data
-      if (mode === 'single') {
-        data = await queryLegal(trimmed)
-        setResult(data)
-      } else {
-        const [baseRes, ftRes] = await Promise.all([
-          queryBase(trimmed),
-          queryLegal(trimmed),
-        ])
-        setCompare({ question: trimmed, base: baseRes, finetuned: ftRes })
-      }
+      const data = await queryLegal(trimmed)
+      setResult(data)
       clearTimeout(t1); clearTimeout(t2)
       setHistory(h => [{ question: trimmed, time: new Date().toLocaleTimeString() }, ...h].slice(0, 6))
       setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
@@ -237,7 +209,7 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [question, loading, mode])
+  }, [question, loading])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit() }
@@ -315,24 +287,6 @@ export default function App() {
             <div className="px-5 pt-5 pb-3">
               <div className="flex items-center justify-between gap-3 mb-3">
                 <p className="text-[10px] font-bold tracking-widest uppercase text-gray-300">Your Question</p>
-                <div className="inline-flex items-center text-[10px] bg-gray-50 border border-purple-100 rounded-full p-0.5">
-                  <button
-                    type="button"
-                    onClick={() => !loading && setMode('single')}
-                    className={`px-2.5 py-1 rounded-full font-semibold transition-colors ${mode === 'single' ? 'bg-purple-600 text-white shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}
-                    disabled={loading}
-                  >
-                    SLM + RAG
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => !loading && setMode('compare')}
-                    className={`px-2.5 py-1 rounded-full font-semibold transition-colors ${mode === 'compare' ? 'bg-purple-600 text-white shadow-sm' : 'text-gray-500 hover:text-purple-600'}`}
-                    disabled={loading}
-                  >
-                    Comparison
-                  </button>
-                </div>
               </div>
               <textarea
                 ref={textareaRef}
@@ -372,7 +326,7 @@ export default function App() {
               <div>
                 <p className="text-sm font-semibold text-red-700 mb-0.5">Request failed</p>
                 <p className="text-xs text-red-500">{error}</p>
-                <p className="text-xs text-red-400 mt-1">Is the backend running at localhost:8000?</p>
+                <p className="text-xs text-red-400 mt-1">Check that `VITE_API_BASE` points to your running backend.</p>
               </div>
             </div>
           )}
@@ -391,43 +345,6 @@ export default function App() {
               <HydeCard passage={result.hyde_passage} />
               <DocsCard docs={result.retrieved_docs} />
               <AnswerCard answer={result.answer} />
-            </div>
-          )}
-
-          {mode === 'compare' && compare && !loading && (
-            <div ref={resultsRef} className="space-y-3" style={{ animation: 'fadeUp 0.35s ease' }}>
-              <div className="flex items-center justify-between px-1 py-1">
-                <p className="text-xs font-semibold text-gray-700">
-                  Comparison mode
-                  <span className="font-normal text-gray-400 ml-2 italic">"{compare.question.slice(0, 60)}{compare.question.length > 60 ? '…' : ''}"</span>
-                </p>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between px-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-gray-900 text-white">Base LLM</span>
-                      <span className="text-[11px] text-gray-500">Qwen2.5 · no fine-tuning</span>
-                    </div>
-                    <span className="text-[11px] text-gray-400 font-mono flex-shrink-0">{compare.base.processing_time}s</span>
-                  </div>
-                  <HydeCard passage={compare.base.hyde_passage} />
-                  <DocsCard docs={compare.base.retrieved_docs} />
-                  <AnswerCard answer={compare.base.answer} />
-                </div>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between px-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-purple-600 text-white">Fine-tuned</span>
-                      <span className="text-[11px] text-gray-500">Qwen2.5 + HyDE + RAG</span>
-                    </div>
-                    <span className="text-[11px] text-gray-400 font-mono flex-shrink-0">{compare.finetuned.processing_time}s</span>
-                  </div>
-                  <HydeCard passage={compare.finetuned.hyde_passage} />
-                  <DocsCard docs={compare.finetuned.retrieved_docs} />
-                  <AnswerCard answer={compare.finetuned.answer} />
-                </div>
-              </div>
             </div>
           )}
 
@@ -450,9 +367,9 @@ export default function App() {
 
       <footer className="border-t border-purple-100 bg-white">
         <div className="max-w-5xl mx-auto px-5 h-10 flex items-center justify-between">
-          <span className="text-[11px] text-gray-500">Dipsan99 · HyDE-RAG · Qwen2.5-3B</span>
+          <span className="text-[11px] text-gray-500">Dipsan99 · HyDE-RAG · zeri000/nepali_legal_qwen_merged_4</span>
           <div className="flex items-center gap-4">
-            <a href="https://huggingface.co/Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged" target="_blank" rel="noreferrer"
+            <a href="https://huggingface.co/zeri000/nepali_legal_qwen_merged_4" target="_blank" rel="noreferrer"
               className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">Model</a>
             <a href="https://huggingface.co/datasets/zeri000/augmented_nepali_legal_qa.csv" target="_blank" rel="noreferrer"
               className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">Dataset</a>

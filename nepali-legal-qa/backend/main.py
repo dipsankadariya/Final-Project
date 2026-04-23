@@ -1,411 +1,248 @@
+# ================================================================
+# BACKEND — FastAPI server for Nepali Legal QA
+# Mirrors the exact pipeline from nepali_rag_qa.ipynb:
+#   - HyDE generation  : fine-tuned SLM (zeri000/nepali_legal_qwen_merged_4)
+#   - Embeddings       : sentence-transformers/LaBSE
+#   - Vector store     : LangChain FAISS from augmented_nepali_legal_rag.txt
+#                        (chunk_size=1000, chunk_overlap=200)
+#   - Answer generation: Groq llama-3.3-70b-versatile (round-robin, 4 keys)
+#
+# Run in Google Colab with:
+#   uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+# ================================================================
+
 import os
 import time
 import logging
-import asyncio
-from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import Optional
 
-import numpy as np
 import torch
-import faiss
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel as PydanticBaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# LangChain / LangGraph — exact imports from nepali_rag_qa.ipynb
+from langchain_community.vectorstores import FAISS
+from langchain_groq import ChatGroq
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import TextLoader
+from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-from datasets import load_dataset
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
-HF_TOKEN        = os.environ.get("HF_TOKEN", "")
-MODEL_REPO      = os.environ.get("MODEL_REPO",      "Dipsan99/nepali-legal-hyde-qwen2.5-1.5b-merged")
-BASE_MODEL_REPO = os.environ.get("BASE_MODEL_REPO", "unsloth/Qwen2.5-1.5B-Instruct")
-EMBED_MODEL     = os.environ.get("EMBED_MODEL",     "intfloat/multilingual-e5-base")
-DATASET_NAME    = os.environ.get("DATASET_NAME",    "zeri000/augmented_nepali_legal_qa.csv")
 
-INDEX_PATH      = os.environ.get("INDEX_PATH",  "./legal_faiss.index")
-DOCS_PATH       = os.environ.get("DOCS_PATH",   "./legal_docs.npy")
+# ── Configuration ─────────────────────────────────────────────────────────────
+MODEL_ID      = os.getenv("MODEL_ID", "zeri000/nepali_legal_qwen_merged_4")
+DOC_FILE_PATH = os.getenv("DOC_FILE_PATH", "/content/augmented_nepali_legal_rag.txt")
 
-TOP_K           = int(os.environ.get("TOP_K",          "5"))
-MAX_NEW_TOKENS  = int(os.environ.get("MAX_NEW_TOKENS",  "512"))
-HYDE_TOKENS     = int(os.environ.get("HYDE_TOKENS",     "256"))
+# Groq API keys — env vars take priority, hardcoded values are the fallback
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "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")
+GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2", "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")
+GROQ_API_KEY_3 = os.getenv("GROQ_API_KEY_3", "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")
+GROQ_API_KEY_4 = os.getenv("GROQ_API_KEY_4", "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")
 
-# ── Retrieval tuning (NEW — only change vs original) ─────────────
-HYDE_WEIGHT     = float(os.environ.get("HYDE_WEIGHT",   "0.6"))
-QUERY_WEIGHT    = float(os.environ.get("QUERY_WEIGHT",  "0.4"))
-MIN_SIMILARITY  = float(os.environ.get("MIN_SIMILARITY","0.35"))
-
-# ── Same system prompt as original (model was fine-tuned with this) ──
-SYSTEM_PROMPT   = "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।"
-
-_executor = ThreadPoolExecutor(max_workers=1)
-state: dict = {}
-
-
-def _get_model_and_tokenizer(kind: str = "finetuned"):
-    """Return (model, tokenizer) pair for either base or fine-tuned SLM.
-
-    kind: "base" | "finetuned" (default)
-    """
-    if kind == "base":
-        return state["base_model"], state["base_tokenizer"]
-    return state["model"], state["tokenizer"]
-
-def _get_eos_ids(tokenizer) -> List[int]:
-    ids = []
-    if tokenizer.eos_token_id is not None:
-        ids.append(tokenizer.eos_token_id)
-
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    if (
-        im_end_id is not None
-        and im_end_id != tokenizer.unk_token_id
-        and im_end_id not in ids
-    ):
-        ids.append(im_end_id)
-
-    return ids
-
-
-def _generate_with_slm(messages: list, max_new_tokens: int, kind: str = "finetuned") -> str:
-    """Generate text — EXACT same params as original working version."""
-    model, tokenizer = _get_model_and_tokenizer(kind)
-    eos_ids    = _get_eos_ids(tokenizer)
-
-    prompt     = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs     = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len  = inputs["input_ids"].shape[1]
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens     = max_new_tokens,
-            temperature        = 0.01,
-            do_sample          = True,
-            top_p              = 0.95,
-            repetition_penalty = 1.2,
-            eos_token_id       = eos_ids,
-            use_cache          = True,
-        )
-
-    new_tokens = output_ids[0][input_len:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-
-def _hyde_retrieve(question: str, top_k: int, kind: str = "finetuned"):
-    """
-    IMPROVED: Hybrid HyDE retrieval.
-    Blends original question embedding (40%) with HyDE passage embedding (60%)
-    so retrieval works even when the HyDE passage is poor.
-    """
-    hyde_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": question.strip()},
-    ]
-    hypothetical_passage = _generate_with_slm(
-        hyde_messages,
-        max_new_tokens=HYDE_TOKENS,
-        kind=kind,
-    )
-
-    # NEW: Embed both original question AND HyDE passage
-    embedder = state["embedder"]
-
-    query_emb = embedder.encode(
-        [f"query: {question.strip()}"],
-        normalize_embeddings=True,
-    ).astype("float32")
-
-    hyde_emb = embedder.encode(
-        [f"query: {hypothetical_passage}"],
-        normalize_embeddings=True,
-    ).astype("float32")
-
-    # NEW: Weighted average for robust retrieval
-    combined_emb = (QUERY_WEIGHT * query_emb + HYDE_WEIGHT * hyde_emb)
-    norm = np.linalg.norm(combined_emb, axis=1, keepdims=True)
-    combined_emb = (combined_emb / norm).astype("float32")
-
-    # Search with blended embedding
-    scores, indices = state["index"].search(combined_emb, top_k)
-
-    # NEW: Filter by similarity score
-    docs       = state["docs"]
-    retrieved  = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx < len(docs) and score >= MIN_SIMILARITY:
-            retrieved.append(docs[idx])
-
-    # Guarantee at least 1 result
-    if not retrieved and indices[0][0] < len(docs):
-        retrieved.append(docs[indices[0][0]])
-
-    return hypothetical_passage, retrieved
-
-
-def _rag_answer(question: str, top_k: int, kind: str = "finetuned") -> dict:
-    """Run full HyDE + RAG — same prompt format as original."""
-    hypothetical_passage, retrieved_docs = _hyde_retrieve(question, top_k, kind=kind)
-
-    # SAME context format as original
-    context_block = "\n\n---\n\n".join(
-        [f"[सन्दर्भ {i + 1}]\n{doc}" for i, doc in enumerate(retrieved_docs)]
-    )
-
-    # SAME prompt format as original
-    answer_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": (
-            f"{question.strip()}"
-            "\n\nतलका कानूनी सन्दर्भहरूको आधारमा विस्तृत उत्तर दिनुहोस्:\n\n"
-            f"{context_block}"
-        )},
-    ]
-
-    final_answer = _generate_with_slm(
-        answer_messages,
-        max_new_tokens=MAX_NEW_TOKENS,
-        kind=kind,
-    )
-
-    return {
-        "question":       question,
-        "hyde_passage":   hypothetical_passage,
-        "retrieved_docs": retrieved_docs,
-        "answer":         final_answer,
-    }
-
-def _build_index(embedder, embed_dim: int):
-    log.info(f"building faiss index from dataset: {DATASET_NAME}")
-    ds   = load_dataset(DATASET_NAME, split="train")
-    docs = []
-
-    for row in ds:
-        instruction = str(row.get("instruction", "")).strip()
-        output      = str(row.get("output",      "")).strip()
-        context     = str(row.get("input",       "")).strip()
-
-        passage = instruction
-        if context:
-            passage += "\n" + context
-        if output:
-            passage += "\n" + output
-
-        docs.append(passage)
-
-    log.info(f"embedding {len(docs)} passages …")
-    BATCH    = 64
-    all_embs = []
-
-    for i in range(0, len(docs), BATCH):
-        batch    = docs[i : i + BATCH]
-        prefixed = [f"passage: {d}" for d in batch]
-        embs     = embedder.encode(
-            prefixed, normalize_embeddings=True, show_progress_bar=False
-        )
-        all_embs.append(embs)
-        if (i // BATCH) % 10 == 0:
-            log.info(f"  embedded {min(i + BATCH, len(docs))} / {len(docs)}")
-
-    embeddings = np.vstack(all_embs).astype("float32")
-    index      = faiss.IndexFlatIP(embed_dim)
-    index.add(embeddings)
-
-    faiss.write_index(index, INDEX_PATH)
-    np.save(DOCS_PATH, np.array(docs, dtype=object))
-    log.info(f"index saved → {INDEX_PATH}  ({index.ntotal} vectors)")
-
-    return index, docs
-
-
-def _load_or_build_index(embedder, embed_dim: int):
-    if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_PATH):
-        try:
-            log.info(f"loading cached index from {INDEX_PATH}")
-            index = faiss.read_index(INDEX_PATH)
-            docs  = list(np.load(DOCS_PATH, allow_pickle=True))
-            if index.ntotal == len(docs) and index.ntotal > 0:
-                log.info(f"cached index ready — {index.ntotal} vectors")
-                return index, docs
-            log.warning("cached index/docs mismatch — rebuilding")
-        except Exception as exc:
-            log.warning(f"failed to load cached index ({exc}) — rebuilding")
-
-    return _build_index(embedder, embed_dim)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info(f"device: {device}")
-
-    log.info(f"loading embedding model: {EMBED_MODEL}")
-    state["embedder"] = SentenceTransformer(EMBED_MODEL, device=device)
-    embed_dim         = state["embedder"].get_sentence_embedding_dimension()
-    log.info(f"embedder ready  dim={embed_dim}")
-
-    log.info(f"loading fine-tuned language model: {MODEL_REPO}")
-    hf_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name     = MODEL_REPO,
-        max_seq_length = 2048,
-        dtype          = None,
-        load_in_4bit   = True,
-        **hf_kwargs,
-    )
-    tokenizer = get_chat_template(tokenizer, chat_template="chatml")
-    FastLanguageModel.for_inference(model)
-
-    state["model"]     = model
-    state["tokenizer"] = tokenizer
-    log.info("fine-tuned language model ready")
-
-    # Optional: separate base model for comparison mode
-    if BASE_MODEL_REPO:
-        try:
-            log.info(f"loading base language model: {BASE_MODEL_REPO}")
-            base_model, base_tokenizer = FastLanguageModel.from_pretrained(
-                model_name     = BASE_MODEL_REPO,
-                max_seq_length = 2048,
-                dtype          = None,
-                load_in_4bit   = True,
-                **hf_kwargs,
-            )
-            base_tokenizer = get_chat_template(base_tokenizer, chat_template="chatml")
-            FastLanguageModel.for_inference(base_model)
-
-            state["base_model"]     = base_model
-            state["base_tokenizer"] = base_tokenizer
-            log.info("base language model ready")
-        except Exception as exc:
-            log.warning(f"failed to load base model ({exc}) — comparison mode base endpoint will be unavailable")
-
-    index, docs        = _load_or_build_index(state["embedder"], embed_dim)
-    state["index"]     = index
-    state["docs"]      = docs
-
-    log.info("startup complete — api is live")
-    yield
-    log.info("shutting down")
-
-
-app = FastAPI(title="Nepali Legal QA", version="2.1.0", lifespan=lifespan)
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+app = FastAPI(title="Nepali Legal QA — HyDE RAG", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    # Allow any origin; we don't use cookies, so credentials can be disabled.
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ── Global state (populated on startup) ──────────────────────────────────────
+tokenizer   = None
+model       = None
+retriever   = None
+generator   = None   # Groq llm_1  (answer prompt chain)
+generator_2 = None   # Groq llm_2
+generator_3 = None   # Groq llm_3
+device      = "cuda" if torch.cuda.is_available() else "cpu"
 
-class QueryRequest(BaseModel):
+# Round-robin counter — same logic as the notebook's /ask endpoint
+request_counter = [0]
+
+
+# ── HyDE: generate hypothetical document with local SLM ──────────────────────
+def generate_hyde_document(user_query: str) -> str:
+    """
+    Exact copy of generate_hyde_document() from nepali_rag_qa.ipynb.
+    Uses the fine-tuned Qwen2.5 SLM to produce a hypothetical legal passage
+    that is then embedded and used to retrieve real documents from FAISS.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।",
+        },
+        {
+            "role": "user",
+            "content": (
+                "यस प्रश्नको आधारमा एउटा विस्तृत र सम्भावित कानूनी उत्तर वा "
+                f"व्याख्या तयार गर्नुहोस्: {user_query}"
+            ),
+        },
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer([prompt], return_tensors="pt").to(device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.3,
+        top_p=0.95,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    input_length     = inputs.input_ids.shape[1]
+    generated_tokens = outputs[0][input_length:]
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+
+# ── Startup: load models and build pipeline ───────────────────────────────────
+@app.on_event("startup")
+def load_models():
+    global tokenizer, model, retriever
+    global generator, generator_2, generator_3
+
+    log.info("Device: %s", device)
+
+    # 1. Fine-tuned SLM — for HyDE generation only
+    log.info("Loading tokenizer: %s", MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+    log.info("Loading model: %s", MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        device_map="auto",   # uses GPU automatically in Colab
+    )
+    log.info("SLM loaded ✓")
+
+    # 2. Build FAISS vector store — exact pipeline from nepali_rag_qa.ipynb
+    log.info("Loading embeddings: sentence-transformers/LaBSE")
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/LaBSE")
+
+    # Load corpus: try local .txt file first, otherwise download from HuggingFace
+    local_txt = DOC_FILE_PATH
+    if os.path.exists(local_txt):
+        log.info("Loading documents from local file: %s", local_txt)
+        loader  = TextLoader(local_txt)
+        raw_docs = loader.load()
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n"]
+        )
+        chunks = splitter.split_documents(raw_docs)
+    else:
+        log.info("Local file not found — downloading dataset from HuggingFace...")
+        from datasets import load_dataset
+        from langchain_core.documents import Document
+
+        hf_dataset = load_dataset("zeri000/augmented_nepali_legal_qa.csv", split="train")
+        log.info("Downloaded %d rows from HuggingFace", len(hf_dataset))
+
+        # Convert each Q&A row into a Document (question + answer as page_content)
+        chunks = [
+            Document(
+                page_content=f"प्रश्न: {row['question']}\nउत्तर: {row['answer']}",
+                metadata={"row": i},
+            )
+            for i, row in enumerate(hf_dataset)
+            if row.get("question") and row.get("answer")
+        ]
+        log.info("Built %d documents from dataset", len(chunks))
+
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    retriever    = vector_store.as_retriever(search_kwargs={"k": 3})
+    log.info("FAISS index ready ✓")
+
+    # 3. Groq LLMs — llama-3.3-70b-versatile, 4 keys for rate-limit headroom
+    groq_model = "llama-3.3-70b-versatile"
+    llm   = ChatGroq(model=groq_model, api_key=GROQ_API_KEY)
+    llm_2 = ChatGroq(model=groq_model, api_key=GROQ_API_KEY_2)
+    llm_3 = ChatGroq(model=groq_model, api_key=GROQ_API_KEY_3)
+    llm_4 = ChatGroq(model=groq_model, api_key=GROQ_API_KEY_4)  # noqa: F841 (kept for parity)
+
+    # 4. Answer-generation prompt chains — exact from nepali_rag_qa.ipynb
+    system = """
+You are an advance answer generating assistant who can generate answer in complete nepali text.
+"""
+    answer_prompt = ChatPromptTemplate(
+        [
+            ("system", system),
+            ("human", "Generate the best answer on the basis of this {document} for user {query}"),
+        ]
+    )
+    generator   = answer_prompt | llm
+    generator_2 = answer_prompt | llm_2
+    generator_3 = answer_prompt | llm_3
+
+    log.info("RAG pipeline ready ✓")
+
+
+# ── API schemas ───────────────────────────────────────────────────────────────
+class QueryRequest(PydanticBaseModel):
     question: str
-    top_k: int = TOP_K
+    top_k: Optional[int] = 3   # default k=3, matches notebook
 
 
-class QueryResponse(BaseModel):
-    question:        str
-    hyde_passage:    str
-    retrieved_docs:  List[str]
-    answer:          str
+class QueryResponse(PydanticBaseModel):
+    question: str
+    hyde_passage: str
+    retrieved_docs: list[str]
+    answer: str
     processing_time: float
 
 
-class HealthResponse(BaseModel):
-    status:     str
-    model:      str
-    index_size: int
-    device:     str
-
-
-@app.get("/api/health", response_model=HealthResponse)
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/api/health")
 def health():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    index  = state.get("index")
-    base_ok = "base_model" in state and "base_tokenizer" in state
-    return HealthResponse(
-        status     = "ok",
-        model      = MODEL_REPO,
-        index_size = index.ntotal if index else 0,
-        device     = device,
-    )
+    return {
+        "status": "ok",
+        "model": MODEL_ID,
+        "device": device,
+        "has_vector_store": retriever is not None,
+        "has_llm": generator is not None,
+    }
 
 
 @app.post("/api/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
+def query(req: QueryRequest):
+    if generator is None or retriever is None:
+        raise HTTPException(status_code=503, detail="Pipeline not ready yet")
 
-    t0 = time.time()
-    log.info(f"query: {req.question[:100]}")
+    t0 = time.perf_counter()
 
-    loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        _executor,
-        _rag_answer,
-        req.question,
-        req.top_k,
-        "finetuned",
-    )
+    # Step 1 — HyDE: local SLM generates a hypothetical legal passage
+    hyde_passage = generate_hyde_document(req.question)
 
-    elapsed = round(time.time() - t0, 2)
-    log.info(f"done in {elapsed}s")
+    # Step 2 — Retrieval: embed HyDE passage, search FAISS
+    docs = retriever.invoke(hyde_passage)
 
+    # Step 3 — Answer: round-robin across Groq API keys (same logic as notebook)
+    i = request_counter[0]
+    request_counter[0] += 1
+
+    if i % 2 == 0:
+        response = generator.invoke({"document": docs, "query": req.question})
+    elif i % 3 == 0:
+        response = generator_2.invoke({"document": docs, "query": req.question})
+    else:
+        response = generator_3.invoke({"document": docs, "query": req.question})
+
+    answer  = response.content
+    context = [doc.page_content for doc in docs]
+
+    processing_time = round(time.perf_counter() - t0, 2)
     return QueryResponse(
-        question        = result["question"],
-        hyde_passage    = result["hyde_passage"],
-        retrieved_docs  = result["retrieved_docs"],
-        answer          = result["answer"],
-        processing_time = elapsed,
+        question=req.question,
+        hyde_passage=hyde_passage,
+        retrieved_docs=context,
+        answer=answer,
+        processing_time=processing_time,
     )
-
-
-@app.post("/api/query_base", response_model=QueryResponse)
-async def query_base(req: QueryRequest):
-    """Same HyDE + RAG pipeline, but using the *base* SLM.
-
-    This is used only for comparison mode in the UI.
-    """
-    if "base_model" not in state or "base_tokenizer" not in state:
-        raise HTTPException(status_code=503, detail="Base model not loaded on server")
-
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    t0 = time.time()
-    log.info(f"[base] query: {req.question[:100]}")
-
-    loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        _executor,
-        _rag_answer,
-        req.question,
-        req.top_k,
-        "base",
-    )
-
-    elapsed = round(time.time() - t0, 2)
-    log.info(f"[base] done in {elapsed}s")
-
-    return QueryResponse(
-        question        = result["question"],
-        hyde_passage    = result["hyde_passage"],
-        retrieved_docs  = result["retrieved_docs"],
-        answer          = result["answer"],
-        processing_time = elapsed,
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

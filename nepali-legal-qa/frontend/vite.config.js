@@ -9,10 +9,16 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       port: 3000,
+      // Proxy all /api/* requests to the backend (Colab URL or localhost)
+      // This avoids CORS issues when developing locally.
       proxy: {
         '/api': {
           target: proxyTarget,
           changeOrigin: true,
+          // Pass ngrok header so it skips the browser warning page
+          headers: {
+            'ngrok-skip-browser-warning': 'true',
+          },
         },
       },
     },
