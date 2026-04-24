@@ -110,21 +110,42 @@ function DocsCard({ docs }) {
   )
 }
 
-function AnswerCard({ answer }) {
+function AnswerCard({ title, label, answer, icon, bgGradient }) {
   return (
     <div className="rounded-xl overflow-hidden border border-purple-200 shadow-md shadow-purple-100 bg-white">
-      <div className="flex items-center gap-3 px-4 py-3 bg-gradient-to-r from-purple-600 to-violet-600">
+      <div className={`flex items-center gap-3 px-4 py-3 ${bgGradient}`}>
         <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-white/20 text-white border border-white/25 flex-shrink-0">
-	      answer
+          {title}
         </span>
-        <span className="text-xs font-medium text-white/90">Legal response grounded in retrieved context</span>
+        <span className="text-xs font-medium text-white/90">{label}</span>
         <svg className="ml-auto flex-shrink-0" width="14" height="14" viewBox="0 0 24 24" fill="white" opacity="0.5">
-          <path d="M12 2l2.4 7.6H22l-6.2 4.5 2.4 7.5L12 17.1l-6.2 4.5 2.4-7.5L2 9.6h7.6z"/>
+          {icon}
         </svg>
       </div>
       <div className="p-5">
         <p className="text-sm leading-[1.9] text-gray-800 whitespace-pre-wrap">{answer}</p>
       </div>
+    </div>
+  )
+}
+
+function DualAnswerCard({ ownModelAnswer, groqAnswer }) {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      <AnswerCard
+        title="Your Model"
+        label="Fine-tuned Qwen2.5 SLM"
+        answer={ownModelAnswer}
+        icon={<path d="M12 1L3 5v6c0 5.25 3.75 10.15 9 11.35C17.25 21.15 21 16.25 21 11V5L12 1z"/>}
+        bgGradient="bg-gradient-to-r from-orange-600 to-amber-600"
+      />
+      <AnswerCard
+        title="Groq LLM"
+        label="Llama-3.3-70b-versatile"
+        answer={groqAnswer}
+        icon={<path d="M12 2l2.4 7.6H22l-6.2 4.5 2.4 7.5L12 17.1l-6.2 4.5 2.4-7.5L2 9.6h7.6z"/>}
+        bgGradient="bg-gradient-to-r from-purple-600 to-violet-600"
+      />
     </div>
   )
 }
@@ -160,13 +181,13 @@ function LoadingView({ phase }) {
     <div className="bg-white rounded-2xl border border-purple-100 px-8 py-10 text-center shadow-sm">
       <div className="flex justify-center mb-5"><Spinner size="lg" /></div>
       <p className="text-sm font-semibold text-gray-700 mb-1">Processing your query</p>
-      <p className="text-xs text-gray-400 mb-8">Running the HyDE + RAG pipeline</p>
+      <p className="text-xs text-gray-400 mb-8">Generating answers from both models</p>
       <div className="flex items-start gap-2 max-w-sm mx-auto">
         <PipelineStep num="1" label="Generate HyDE" status={st(0)} />
         {line(idx >= 1)}
         <PipelineStep num="2" label="Search FAISS" status={st(1)} />
         {line(idx >= 2)}
-        <PipelineStep num="3" label="Generate answer" status={st(2)} />
+        <PipelineStep num="3" label="Dual answers" status={st(2)} />
       </div>
     </div>
   )
@@ -230,7 +251,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-1.5 text-[11px] text-purple-500 font-medium bg-purple-50 border border-purple-100 rounded-full px-3 py-1">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="hidden sm:block">HyDE · FAISS · Qwen2.5</span>
+            <span className="hidden sm:block">Dual answers • HyDE • FAISS</span>
           </div>
         </div>
       </header>
@@ -240,10 +261,10 @@ export default function App() {
           <div className="rounded-2xl bg-gradient-to-br from-purple-600 to-violet-700 p-5 text-white shadow-lg shadow-purple-200">
             <p className="text-[10px] font-bold tracking-widest uppercase text-purple-200 mb-3">About</p>
             <p className="text-xs leading-relaxed text-white/85 mb-4">
-              Ask questions about Nepali law. Powered by a fine-tuned Qwen2.5 SLM with HyDE retrieval and RAG.
+              Ask questions about Nepali law. Dual-model answers powered by fine-tuned Qwen2.5 SLM and Groq LLM.
             </p>
             <div className="space-y-2 text-[11px] text-purple-200">
-              {['SLM generates hypothetical answer', 'FAISS retrieves real legal passages', 'SLM answers with real context'].map((s, i) => (
+              {['SLM generates hypothetical answer', 'FAISS retrieves legal passages', 'Both models answer with context'].map((s, i) => (
                 <div key={i} className="flex items-start gap-2">
                   <span className="mt-px w-4 h-4 rounded bg-white/15 text-white text-[9px] font-bold flex items-center justify-center flex-shrink-0">
                     {i + 1}
@@ -344,7 +365,7 @@ export default function App() {
               </div>
               <HydeCard passage={result.hyde_passage} />
               <DocsCard docs={result.retrieved_docs} />
-              <AnswerCard answer={result.answer} />
+              <DualAnswerCard ownModelAnswer={result.answer_own_model} groqAnswer={result.answer_groq} />
             </div>
           )}
 
@@ -367,10 +388,10 @@ export default function App() {
 
       <footer className="border-t border-purple-100 bg-white">
         <div className="max-w-5xl mx-auto px-5 h-10 flex items-center justify-between">
-          <span className="text-[11px] text-gray-500">Dipsan99 · HyDE-RAG · zeri000/nepali_legal_qwen_merged_4</span>
+          <span className="text-[11px] text-gray-500">Dipsan99 · Dual-Model RAG · Qwen2.5 + Groq LLM</span>
           <div className="flex items-center gap-4">
             <a href="https://huggingface.co/zeri000/nepali_legal_qwen_merged_4" target="_blank" rel="noreferrer"
-              className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">Model</a>
+              className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">SLM</a>
             <a href="https://huggingface.co/datasets/zeri000/augmented_nepali_legal_qa.csv" target="_blank" rel="noreferrer"
               className="text-[11px] text-gray-500 hover:text-purple-600 transition-colors">Dataset</a>
           </div>

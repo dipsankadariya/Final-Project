@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 MODEL_ID      = os.getenv("MODEL_ID", "zeri000/nepali_legal_qwen_merged_4")
-DOC_FILE_PATH = os.getenv("DOC_FILE_PATH", "/content/augmented_nepali_legal_rag.txt")
+DOC_FILE_PATH = os.getenv("DOC_FILE_PATH", "../../../augmented_nepali_legal_rag.txt")
 
 # Groq API keys — env vars take priority, hardcoded values are the fallback
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "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")
@@ -104,6 +104,45 @@ def generate_hyde_document(user_query: str) -> str:
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
+# ── Local SLM: generate answer using fine-tuned model ────────────────────────────
+def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
+    """
+    Uses the fine-tuned SLM to generate a legal answer based on retrieved documents.
+    """
+    # Format documents for context
+    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    
+    messages = [
+        {
+            "role": "system",
+            "content": "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।",
+        },
+        {
+            "role": "user",
+            "content": (
+                f"यस कानूनी सन्दर्भको आधारमा निम्न प्रश्नको उत्तर दिनुहोस्:\n\n"
+                f"सन्दर्भ:\n{context}\n\n"
+                f"प्रश्न: {user_query}"
+            ),
+        },
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer([prompt], return_tensors="pt").to(device)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        temperature=0.5,
+        top_p=0.95,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    input_length     = inputs.input_ids.shape[1]
+    generated_tokens = outputs[0][input_length:]
+    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+
 # ── Startup: load models and build pipeline ───────────────────────────────────
 @app.on_event("startup")
 def load_models():
@@ -128,53 +167,22 @@ def load_models():
     log.info("Loading embeddings: sentence-transformers/LaBSE")
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/LaBSE")
 
-    # Load corpus: try local .txt file first, otherwise download from HuggingFace
+    # Load corpus from local .txt file only
     local_txt = DOC_FILE_PATH
-    if os.path.exists(local_txt):
-        log.info("Loading documents from local file: %s", local_txt)
-        loader  = TextLoader(local_txt)
-        raw_docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n"]
+    if not os.path.exists(local_txt):
+        raise RuntimeError(
+            f"Document file not found at: {local_txt}\n"
+            f"Please ensure augmented_nepali_legal_rag.txt exists at the correct location."
         )
-        chunks = splitter.split_documents(raw_docs)
-    else:
-        log.info("Local file not found — downloading dataset from HuggingFace...")
-        from datasets import load_dataset
-        from langchain_core.documents import Document
-
-        hf_dataset = load_dataset("zeri000/augmented_nepali_legal_qa.csv", split="train")
-        log.info("Downloaded %d rows from HuggingFace", len(hf_dataset))
-
-        # Dataset columns (confirmed from Ritesh_fine_tune notebook):
-        #   instruction = question / prompt
-        #   output      = answer
-        #   input       = optional context (may be empty)
-        log.info("Dataset columns: %s", hf_dataset.column_names)
-        chunks = []
-        for i, row in enumerate(hf_dataset):
-            instruction = row.get("instruction", "").strip()
-            output      = row.get("output", "").strip()
-            context     = row.get("input", "").strip()
-
-            if not instruction or not output:
-                continue
-
-            # Build page_content exactly like the fine-tuning format
-            user_text = instruction
-            if context:
-                user_text += f"\n\nसन्दर्भ (Context):\n{context}"
-
-            chunks.append(Document(
-                page_content=f"प्रश्न: {user_text}\nउत्तर: {output}",
-                metadata={"row": i},
-            ))
-
-        log.info("Built %d documents from dataset", len(chunks))
-        if not chunks:
-            raise RuntimeError(
-                f"Dataset produced 0 documents. Columns found: {hf_dataset.column_names}"
-            )
+    
+    log.info("Loading documents from local file: %s", local_txt)
+    loader  = TextLoader(local_txt)
+    raw_docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n"]
+    )
+    chunks = splitter.split_documents(raw_docs)
+    log.info("Loaded %d chunks from file", len(chunks))
 
     vector_store = FAISS.from_documents(chunks, embeddings)
     retriever    = vector_store.as_retriever(search_kwargs={"k": 3})
@@ -214,7 +222,8 @@ class QueryResponse(PydanticBaseModel):
     question: str
     hyde_passage: str
     retrieved_docs: list[str]
-    answer: str
+    answer_own_model: str      # Answer from fine-tuned SLM
+    answer_groq: str           # Answer from Groq LLM
     processing_time: float
 
 
@@ -232,7 +241,7 @@ def health():
 
 @app.post("/api/query", response_model=QueryResponse)
 def query(req: QueryRequest):
-    if generator is None or retriever is None:
+    if generator is None or retriever is None or model is None:
         raise HTTPException(status_code=503, detail="Pipeline not ready yet")
 
     t0 = time.perf_counter()
@@ -242,8 +251,17 @@ def query(req: QueryRequest):
 
     # Step 2 — Retrieval: embed HyDE passage, search FAISS
     docs = retriever.invoke(hyde_passage)
+    context = [doc.page_content for doc in docs]
 
-    # Step 3 — Answer: round-robin across Groq API keys (same logic as notebook)
+    # Step 3a — Answer from own model (fine-tuned SLM)
+    try:
+        answer_own = generate_answer_from_slm(req.question, docs)
+        log.info("Own model answer generated ✓")
+    except Exception as e:
+        log.error(f"Error generating answer from own model: {e}")
+        answer_own = f"Error: {str(e)}"
+
+    # Step 3b — Answer from Groq (round-robin across API keys)
     i = request_counter[0]
     request_counter[0] += 1
 
@@ -254,14 +272,14 @@ def query(req: QueryRequest):
     else:
         response = generator_3.invoke({"document": docs, "query": req.question})
 
-    answer  = response.content
-    context = [doc.page_content for doc in docs]
+    answer_groq = response.content
 
     processing_time = round(time.perf_counter() - t0, 2)
     return QueryResponse(
         question=req.question,
         hyde_passage=hyde_passage,
         retrieved_docs=context,
-        answer=answer,
+        answer_own_model=answer_own,
+        answer_groq=answer_groq,
         processing_time=processing_time,
     )
