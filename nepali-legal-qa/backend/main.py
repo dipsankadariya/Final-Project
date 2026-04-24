@@ -108,10 +108,17 @@ def generate_hyde_document(user_query: str) -> str:
 def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
     """
     Uses the fine-tuned SLM to generate a legal answer based on retrieved documents.
+    Uses the exact ChatML format the model was fine-tuned on (matches Ritesh_fine_tune notebook).
     """
-    # Format documents for context
+    # Format documents for context (same as fine-tuning format)
     context = "\n\n".join([doc.page_content for doc in retrieved_docs])
     
+    # Build user message exactly as fine-tuning format: question + optional context
+    user_text = user_query
+    if context:
+        user_text += f"\n\nसन्दर्भ (Context):\n{context}"
+    
+    # Use ChatML format with proper roles (exact fine-tuning setup)
     messages = [
         {
             "role": "system",
@@ -119,22 +126,23 @@ def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
         },
         {
             "role": "user",
-            "content": (
-                f"यस कानूनी सन्दर्भको आधारमा निम्न प्रश्नको उत्तर दिनुहोस्:\n\n"
-                f"सन्दर्भ:\n{context}\n\n"
-                f"प्रश्न: {user_query}"
-            ),
+            "content": user_text,
         },
     ]
+    
+    # Apply chat template with add_generation_prompt=True (matches fine-tuning inference)
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer([prompt], return_tensors="pt").to(device)
+    
+    # Generate with parameters from Ritesh_fine_tune inference test
     outputs = model.generate(
         **inputs,
         max_new_tokens=512,
-        temperature=0.5,
+        temperature=0.01,          # Ultra-low: factual legal information recall
         top_p=0.95,
+        repetition_penalty=1.0,    # Prevent repetition in Nepali text
         do_sample=True,
         pad_token_id=tokenizer.eos_token_id,
     )
