@@ -55,16 +55,61 @@ app.add_middleware(
 )
 
 # ── Global state (populated on startup) ──────────────────────────────────────
-tokenizer   = None
-model       = None
-retriever   = None
-generator   = None   # Groq llm_1  (answer prompt chain)
-generator_2 = None   # Groq llm_2
-generator_3 = None   # Groq llm_3
-device      = "cuda" if torch.cuda.is_available() else "cpu"
+tokenizer    = None
+model        = None
+retriever    = None
+vector_store = None
+generator    = None   # Groq llm_1  (answer prompt chain)
+generator_2  = None   # Groq llm_2
+generator_3  = None   # Groq llm_3
+device       = "cuda" if torch.cuda.is_available() else "cpu"
+terminators  = None
 
 # Round-robin counter — same logic as the notebook's /ask endpoint
 request_counter = [0]
+
+
+def _build_terminators():
+    ids = []
+    if tokenizer.eos_token_id is not None:
+        ids.append(tokenizer.eos_token_id)
+
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if im_end_id is not None and im_end_id != tokenizer.unk_token_id:
+        ids.append(im_end_id)
+
+    return list(dict.fromkeys(ids)) or None
+
+
+def _format_context_blocks(retrieved_docs: list) -> str:
+    return "\n\n".join(
+        f"[सन्दर्भ {i}]\n{doc.page_content.strip()}"
+        for i, doc in enumerate(retrieved_docs, start=1)
+    )
+
+
+def retrieve_documents(user_query: str, hyde_passage: str, top_k: int):
+    """
+    Merge retrieval from HyDE and the original user query.
+    This helps when the HyDE passage drifts semantically.
+    """
+    k = max(1, min(top_k, 8))
+    candidates = []
+    candidates.extend(vector_store.similarity_search(hyde_passage, k=k))
+    candidates.extend(vector_store.similarity_search(user_query, k=k))
+
+    deduped = []
+    seen = set()
+    for doc in candidates:
+        content = doc.page_content.strip()
+        if not content or content in seen:
+            continue
+        seen.add(content)
+        deduped.append(doc)
+        if len(deduped) >= k:
+            break
+
+    return deduped
 
 
 # ── HyDE: generate hypothetical document with local SLM ──────────────────────
@@ -97,6 +142,7 @@ def generate_hyde_document(user_query: str) -> str:
         temperature=0.3,
         top_p=0.95,
         do_sample=True,
+        eos_token_id=terminators,
         pad_token_id=tokenizer.eos_token_id,
     )
     input_length     = inputs.input_ids.shape[1]
@@ -111,7 +157,7 @@ def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
     Uses the exact ChatML format the model was fine-tuned on (matches Ritesh_fine_tune notebook).
     """
     # Format documents for context (same as fine-tuning format)
-    context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    context = _format_context_blocks(retrieved_docs)
     
     # Build user message exactly as fine-tuning format: question + optional context
     user_text = user_query
@@ -139,11 +185,12 @@ def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
     # Generate with parameters from Ritesh_fine_tune inference test
     outputs = model.generate(
         **inputs,
-        max_new_tokens=512,
+        max_new_tokens=384,
         temperature=0.01,          # Ultra-low: factual legal information recall
         top_p=0.95,
         repetition_penalty=1.0,    # Prevent repetition in Nepali text
         do_sample=True,
+        eos_token_id=terminators,
         pad_token_id=tokenizer.eos_token_id,
     )
     input_length     = inputs.input_ids.shape[1]
@@ -154,7 +201,7 @@ def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
 # ── Startup: load models and build pipeline ───────────────────────────────────
 @app.on_event("startup")
 def load_models():
-    global tokenizer, model, retriever
+    global tokenizer, model, retriever, vector_store, terminators
     global generator, generator_2, generator_3
 
     log.info("Device: %s", device)
@@ -169,6 +216,7 @@ def load_models():
         torch_dtype=torch.float16,
         device_map="auto",   # uses GPU automatically in Colab
     )
+    terminators = _build_terminators()
     log.info("SLM loaded ✓")
 
     # 2. Build FAISS vector store — exact pipeline from nepali_rag_qa.ipynb
@@ -205,12 +253,24 @@ def load_models():
 
     # 4. Answer-generation prompt chains — exact from nepali_rag_qa.ipynb
     system = """
-You are an advance answer generating assistant who can generate answer in complete nepali text.
+तपाईं नेपाली कानुनी प्रश्नहरूको उत्तर दिने सहायक हुनुहुन्छ।
+
+नियमहरू:
+- उत्तर नेपालीमा मात्र दिनुहोस्।
+- दिइएको सन्दर्भभित्रको जानकारीलाई मात्र आधार बनाउनुहोस्।
+- सन्दर्भले स्पष्ट उत्तर नदिएमा 'दिइएको सन्दर्भका आधारमा स्पष्ट उत्तर भेटिएन' भन्नुहोस्।
+- अनुमान, अतिरिक्त कानुनी तथ्य, वा बनावटी विवरण नथप्नुहोस्।
+- सम्भव भएसम्म छोटो, स्पष्ट, र कानुनी रूपमा उपयोगी उत्तर दिनुहोस्।
+- उत्तरमा सम्बन्धित सन्दर्भ नम्बर जस्तै [सन्दर्भ 1] उल्लेख गर्नुहोस्।
 """
     answer_prompt = ChatPromptTemplate(
         [
             ("system", system),
-            ("human", "Generate the best answer on the basis of this {document} for user {query}"),
+            (
+                "human",
+                "प्रश्न:\n{query}\n\nकानुनी सन्दर्भ:\n{document}\n\n"
+                "माथिको सन्दर्भका आधारमा मात्र उत्तर दिनुहोस्।",
+            ),
         ]
     )
     generator   = answer_prompt | llm
@@ -258,8 +318,10 @@ def query(req: QueryRequest):
     hyde_passage = generate_hyde_document(req.question)
 
     # Step 2 — Retrieval: embed HyDE passage, search FAISS
-    docs = retriever.invoke(hyde_passage)
+    top_k = max(1, min(req.top_k or 3, 8))
+    docs = retrieve_documents(req.question, hyde_passage, top_k=top_k)
     context = [doc.page_content for doc in docs]
+    formatted_context = _format_context_blocks(docs)
 
     # Step 3a — Answer from own model (fine-tuned SLM)
     try:
@@ -273,12 +335,9 @@ def query(req: QueryRequest):
     i = request_counter[0]
     request_counter[0] += 1
 
-    if i % 2 == 0:
-        response = generator.invoke({"document": docs, "query": req.question})
-    elif i % 3 == 0:
-        response = generator_2.invoke({"document": docs, "query": req.question})
-    else:
-        response = generator_3.invoke({"document": docs, "query": req.question})
+    groq_generators = [generator, generator_2, generator_3]
+    active_generator = groq_generators[i % len(groq_generators)]
+    response = active_generator.invoke({"document": formatted_context, "query": req.question})
 
     answer_groq = response.content
 
