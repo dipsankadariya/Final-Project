@@ -1,51 +1,41 @@
-# ================================================================
-# BACKEND — FastAPI server for Nepali Legal QA
-# Mirrors the exact pipeline from nepali_rag_qa.ipynb:
-#   - HyDE generation  : fine-tuned SLM (zeri000/nepali_legal_qwen_merged_4)
-#   - Embeddings       : sentence-transformers/LaBSE
-#   - Vector store     : LangChain FAISS from augmented_nepali_legal_rag.txt
-#                        (chunk_size=1000, chunk_overlap=200)
-#   - Answer generation: Groq llama-3.3-70b-versatile (round-robin, 4 keys)
-#
-# Run in Google Colab with:
-#   uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
-# ================================================================
-
-import os
-import time
 import logging
+import os
+import re
+import time
 from typing import Optional
 
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel as PydanticBaseModel
+from langchain_community.document_loaders import TextLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# LangChain / LangGraph — exact imports from nepali_rag_qa.ipynb
-from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.document_loaders import TextLoader
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-MODEL_ID      = os.getenv("MODEL_ID", "zeri000/nepali_legal_qwen_merged_4")
+
+MODEL_ID = os.getenv("MODEL_ID", "zeri000/nepali_legal_qwen_merged_4")
 DOC_FILE_PATH = os.getenv("DOC_FILE_PATH", "../../../augmented_nepali_legal_rag.txt")
 
-# Groq API keys — env vars take priority, hardcoded values are the fallback
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "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")
-GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2", "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")
-GROQ_API_KEY_3 = os.getenv("GROQ_API_KEY_3", "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")
-GROQ_API_KEY_4 = os.getenv("GROQ_API_KEY_4", "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")
+GROQ_KEYS = [
+    os.getenv("GROQ_API_KEY"),
+    os.getenv("GROQ_API_KEY_2"),
+    os.getenv("GROQ_API_KEY_3"),
+    os.getenv("GROQ_API_KEY_4"),
+]
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="Nepali Legal QA — HyDE RAG", version="1.0.0")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+app = FastAPI(title="Nepali Legal QA", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,299 +44,373 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Global state (populated on startup) ──────────────────────────────────────
-tokenizer    = None
-model        = None
-retriever    = None
-vector_store = None
-generator    = None   # Groq llm_1  (answer prompt chain)
-generator_2  = None   # Groq llm_2
-generator_3  = None   # Groq llm_3
-device       = "cuda" if torch.cuda.is_available() else "cpu"
-terminators  = None
 
-# Round-robin counter — same logic as the notebook's /ask endpoint
+tokenizer = None
+model = None
+vector_store = None
+retrieval_corpus = []
+generators = []
+terminators = None
 request_counter = [0]
 
 
-def _build_terminators():
+class QueryRequest(BaseModel):
+    question: str
+    top_k: Optional[int] = 3
+
+
+class QueryResponse(BaseModel):
+    question: str
+    hyde_passage: str
+    retrieved_docs: list[str]
+    answer_own_model: str
+    answer_groq: str
+    processing_time: float
+
+
+def normalize_text(text: str) -> str:
+    text = text.replace("\u200c", " ").replace("\ufeff", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def tokenize_for_search(text: str) -> set[str]:
+    normalized = normalize_text(text).lower()
+    normalized = re.sub(r"[^\w\u0900-\u097f\s]", " ", normalized)
+    tokens = {token for token in normalized.split() if len(token) > 1}
+    return tokens
+
+
+def build_terminators():
     ids = []
     if tokenizer.eos_token_id is not None:
         ids.append(tokenizer.eos_token_id)
 
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    try:
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    except Exception:
+        im_end_id = None
+
     if im_end_id is not None and im_end_id != tokenizer.unk_token_id:
         ids.append(im_end_id)
 
     return list(dict.fromkeys(ids)) or None
 
 
-def _format_context_blocks(retrieved_docs: list) -> str:
-    return "\n\n".join(
-        f"[सन्दर्भ {i}]\n{doc.page_content.strip()}"
-        for i, doc in enumerate(retrieved_docs, start=1)
+def corpus_passages_from_text(raw_text: str) -> list[str]:
+    blocks = re.split(r"\n\s*\n+", raw_text)
+    passages = []
+    seen = set()
+
+    for block in blocks:
+        passage = normalize_text(block)
+        if len(passage) < 40:
+            continue
+        if passage in seen:
+            continue
+        seen.add(passage)
+        passages.append(passage)
+
+    return passages
+
+
+def build_retrieval_documents(raw_docs: list[Document]) -> list[Document]:
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=900,
+        chunk_overlap=120,
+        separators=["\n\n", "\n", "। ", ". ", " "],
     )
 
-
-def retrieve_documents(user_query: str, hyde_passage: str, top_k: int):
-    """
-    Merge retrieval from HyDE and the original user query.
-    This helps when the HyDE passage drifts semantically.
-    """
-    k = max(1, min(top_k, 8))
-    candidates = []
-    candidates.extend(vector_store.similarity_search(hyde_passage, k=k))
-    candidates.extend(vector_store.similarity_search(user_query, k=k))
+    cleaned_docs = []
+    source_text = "\n\n".join(doc.page_content for doc in raw_docs)
+    for idx, passage in enumerate(corpus_passages_from_text(source_text), start=1):
+        base_doc = Document(page_content=passage, metadata={"passage_id": idx})
+        chunks = splitter.split_documents([base_doc])
+        for chunk in chunks:
+            text = normalize_text(chunk.page_content)
+            if len(text) < 40:
+                continue
+            chunk.page_content = text
+            cleaned_docs.append(chunk)
 
     deduped = []
     seen = set()
-    for doc in candidates:
-        content = doc.page_content.strip()
-        if not content or content in seen:
+    for doc in cleaned_docs:
+        if doc.page_content in seen:
             continue
-        seen.add(content)
+        seen.add(doc.page_content)
         deduped.append(doc)
-        if len(deduped) >= k:
-            break
 
     return deduped
 
 
-# ── HyDE: generate hypothetical document with local SLM ──────────────────────
+def lexical_score(query: str, doc_text: str) -> float:
+    query_tokens = tokenize_for_search(query)
+    doc_tokens = tokenize_for_search(doc_text)
+
+    if not query_tokens or not doc_tokens:
+        return 0.0
+
+    overlap = query_tokens & doc_tokens
+    score = len(overlap) / len(query_tokens)
+
+    normalized_query = normalize_text(query).lower()
+    normalized_doc = normalize_text(doc_text).lower()
+    if normalized_query and normalized_query in normalized_doc:
+        score += 1.0
+
+    longest_terms = [token for token in query_tokens if len(token) >= 4]
+    phrase_hits = sum(1 for token in longest_terms if token in normalized_doc)
+    score += phrase_hits * 0.08
+
+    return score
+
+
+def reciprocal_rank(rank: int) -> float:
+    return 1.0 / (rank + 1)
+
+
+def retrieve_documents(user_query: str, hyde_passage: str, top_k: int) -> list[Document]:
+    k = max(1, min(top_k, 6))
+    vector_k = max(10, k * 4)
+    lexical_k = max(12, k * 5)
+
+    candidates: dict[str, dict] = {}
+
+    vector_runs = [
+        ("query", vector_store.similarity_search_with_score(user_query, k=vector_k)),
+        ("hyde", vector_store.similarity_search_with_score(hyde_passage, k=vector_k)),
+    ]
+
+    for label, results in vector_runs:
+        for rank, (doc, distance) in enumerate(results):
+            content = doc.page_content
+            entry = candidates.setdefault(
+                content,
+                {"doc": doc, "vector": 0.0, "lexical": 0.0},
+            )
+            similarity = 1.0 / (1.0 + float(distance))
+            if label == "query":
+                entry["vector"] += similarity * 0.9 + reciprocal_rank(rank) * 0.4
+            else:
+                entry["vector"] += similarity * 0.7 + reciprocal_rank(rank) * 0.3
+
+    lexical_ranked = sorted(
+        retrieval_corpus,
+        key=lambda doc: lexical_score(user_query, doc.page_content) * 1.2
+        + lexical_score(hyde_passage, doc.page_content) * 0.6,
+        reverse=True,
+    )[:lexical_k]
+
+    for rank, doc in enumerate(lexical_ranked):
+        content = doc.page_content
+        entry = candidates.setdefault(
+            content,
+            {"doc": doc, "vector": 0.0, "lexical": 0.0},
+        )
+        entry["lexical"] += lexical_score(user_query, content) * 1.2
+        entry["lexical"] += lexical_score(hyde_passage, content) * 0.5
+        entry["lexical"] += reciprocal_rank(rank) * 0.5
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: item["lexical"] + item["vector"],
+        reverse=True,
+    )
+
+    return [item["doc"] for item in ranked[:k]]
+
+
+def format_context_blocks(retrieved_docs: list[Document]) -> str:
+    blocks = []
+    for idx, doc in enumerate(retrieved_docs, start=1):
+        blocks.append(f"[Context {idx}]\n{doc.page_content}")
+    return "\n\n".join(blocks)
+
+
 def generate_hyde_document(user_query: str) -> str:
-    """
-    Exact copy of generate_hyde_document() from nepali_rag_qa.ipynb.
-    Uses the fine-tuned Qwen2.5 SLM to produce a hypothetical legal passage
-    that is then embedded and used to retrieve real documents from FAISS.
-    """
     messages = [
         {
             "role": "system",
-            "content": "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।",
+            "content": (
+                "You are an expert Nepali legal assistant. "
+                "Write a short hypothetical legal passage for retrieval."
+            ),
         },
         {
             "role": "user",
             "content": (
-                "यस प्रश्नको आधारमा एउटा विस्तृत र सम्भावित कानूनी उत्तर वा "
-                f"व्याख्या तयार गर्नुहोस्: {user_query}"
+                "Question: "
+                f"{user_query}\n\n"
+                "Write a concise hypothetical answer passage in Nepali Devanagari only. "
+                "Do not add labels or explanations."
             ),
         },
     ]
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer([prompt], return_tensors="pt").to(device)
     outputs = model.generate(
         **inputs,
-        max_new_tokens=512,
-        temperature=0.3,
-        top_p=0.95,
+        max_new_tokens=220,
+        temperature=0.2,
+        top_p=0.9,
         do_sample=True,
         eos_token_id=terminators,
         pad_token_id=tokenizer.eos_token_id,
     )
-    input_length     = inputs.input_ids.shape[1]
+    input_length = inputs.input_ids.shape[1]
     generated_tokens = outputs[0][input_length:]
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
-# ── Local SLM: generate answer using fine-tuned model ────────────────────────────
-def generate_answer_from_slm(user_query: str, retrieved_docs: list) -> str:
-    """
-    Uses the fine-tuned SLM to generate a legal answer based on retrieved documents.
-    Uses the exact ChatML format the model was fine-tuned on (matches Ritesh_fine_tune notebook).
-    """
-    # Format documents for context (same as fine-tuning format)
-    context = _format_context_blocks(retrieved_docs)
-    
-    # Build user message exactly as fine-tuning format: question + optional context
-    user_text = user_query
-    if context:
-        user_text += f"\n\nसन्दर्भ (Context):\n{context}"
-    
-    # Use ChatML format with proper roles (exact fine-tuning setup)
+def generate_answer_from_slm(user_query: str, retrieved_docs: list[Document]) -> str:
+    context = format_context_blocks(retrieved_docs)
     messages = [
         {
             "role": "system",
-            "content": "तपाईं एक विशेषज्ञ नेपाली कानूनी सहायक हुनुहुन्छ।",
+            "content": (
+                "You are an expert Nepali legal assistant. "
+                "Answer in Nepali only. Use only the provided context. "
+                "If the context is insufficient, say that clearly."
+            ),
         },
         {
             "role": "user",
-            "content": user_text,
+            "content": (
+                f"Question:\n{user_query}\n\n"
+                f"Legal context:\n{context}\n\n"
+                "Answer in Nepali only. Do not invent facts outside the context."
+            ),
         },
     ]
-    
-    # Apply chat template with add_generation_prompt=True (matches fine-tuning inference)
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer([prompt], return_tensors="pt").to(device)
-    
-    # Generate with parameters from Ritesh_fine_tune inference test
     outputs = model.generate(
         **inputs,
-        max_new_tokens=384,
-        temperature=0.01,          # Ultra-low: factual legal information recall
-        top_p=0.95,
-        repetition_penalty=1.0,    # Prevent repetition in Nepali text
-        do_sample=True,
+        max_new_tokens=220,
+        do_sample=False,
+        repetition_penalty=1.05,
         eos_token_id=terminators,
         pad_token_id=tokenizer.eos_token_id,
     )
-    input_length     = inputs.input_ids.shape[1]
+    input_length = inputs.input_ids.shape[1]
     generated_tokens = outputs[0][input_length:]
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
-# ── Startup: load models and build pipeline ───────────────────────────────────
 @app.on_event("startup")
 def load_models():
-    global tokenizer, model, retriever, vector_store, terminators
-    global generator, generator_2, generator_3
+    global tokenizer, model, vector_store, retrieval_corpus, generators, terminators
 
     log.info("Device: %s", device)
 
-    # 1. Fine-tuned SLM — for HyDE generation only
-    log.info("Loading tokenizer: %s", MODEL_ID)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-
-    log.info("Loading model: %s", MODEL_ID)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
-        device_map="auto",   # uses GPU automatically in Colab
+        device_map="auto",
     )
-    terminators = _build_terminators()
-    log.info("SLM loaded ✓")
+    terminators = build_terminators()
+    log.info("Loaded local SLM: %s", MODEL_ID)
 
-    # 2. Build FAISS vector store — exact pipeline from nepali_rag_qa.ipynb
-    log.info("Loading embeddings: sentence-transformers/LaBSE")
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/LaBSE")
+    if not os.path.exists(DOC_FILE_PATH):
+        raise RuntimeError(f"Document file not found: {DOC_FILE_PATH}")
 
-    # Load corpus from local .txt file only
-    local_txt = DOC_FILE_PATH
-    if not os.path.exists(local_txt):
-        raise RuntimeError(
-            f"Document file not found at: {local_txt}\n"
-            f"Please ensure augmented_nepali_legal_rag.txt exists at the correct location."
-        )
-    
-    log.info("Loading documents from local file: %s", local_txt)
-    loader  = TextLoader(local_txt)
+    loader = TextLoader(DOC_FILE_PATH, autodetect_encoding=True)
     raw_docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n"]
-    )
-    chunks = splitter.split_documents(raw_docs)
-    log.info("Loaded %d chunks from file", len(chunks))
+    retrieval_corpus = build_retrieval_documents(raw_docs)
+    if not retrieval_corpus:
+        raise RuntimeError("No retrieval documents were built from the corpus.")
 
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    retriever    = vector_store.as_retriever(search_kwargs={"k": 3})
-    log.info("FAISS index ready ✓")
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/LaBSE")
+    vector_store = FAISS.from_documents(retrieval_corpus, embeddings)
+    log.info("Built retrieval corpus with %d cleaned passages", len(retrieval_corpus))
 
-    # 3. Groq LLMs — llama-3.3-70b-versatile, 4 keys for rate-limit headroom
-    groq_model = "llama-3.3-70b-versatile"
-    llm   = ChatGroq(model=groq_model, api_key=GROQ_API_KEY)
-    llm_2 = ChatGroq(model=groq_model, api_key=GROQ_API_KEY_2)
-    llm_3 = ChatGroq(model=groq_model, api_key=GROQ_API_KEY_3)
-    llm_4 = ChatGroq(model=groq_model, api_key=GROQ_API_KEY_4)  # noqa: F841 (kept for parity)
+    active_keys = [key for key in GROQ_KEYS if key]
+    if not active_keys:
+        raise RuntimeError("At least one GROQ_API_KEY environment variable is required.")
 
-    # 4. Answer-generation prompt chains — exact from nepali_rag_qa.ipynb
-    system = """
-तपाईं नेपाली कानुनी प्रश्नहरूको उत्तर दिने सहायक हुनुहुन्छ।
+    system_prompt = """
+You are a Nepali legal QA assistant.
 
-नियमहरू:
-- उत्तर नेपालीमा मात्र दिनुहोस्।
-- दिइएको सन्दर्भभित्रको जानकारीलाई मात्र आधार बनाउनुहोस्।
-- सन्दर्भले स्पष्ट उत्तर नदिएमा 'दिइएको सन्दर्भका आधारमा स्पष्ट उत्तर भेटिएन' भन्नुहोस्।
-- अनुमान, अतिरिक्त कानुनी तथ्य, वा बनावटी विवरण नथप्नुहोस्।
-- सम्भव भएसम्म छोटो, स्पष्ट, र कानुनी रूपमा उपयोगी उत्तर दिनुहोस्।
-- उत्तरमा सम्बन्धित सन्दर्भ नम्बर जस्तै [सन्दर्भ 1] उल्लेख गर्नुहोस्।
+Rules:
+- Answer in Nepali only.
+- Use only the supplied context.
+- If the context is insufficient or contradictory, say so clearly.
+- Do not invent legal facts.
+- Prefer a short, direct answer.
 """
+
     answer_prompt = ChatPromptTemplate(
         [
-            ("system", system),
+            ("system", system_prompt),
             (
                 "human",
-                "प्रश्न:\n{query}\n\nकानुनी सन्दर्भ:\n{document}\n\n"
-                "माथिको सन्दर्भका आधारमा मात्र उत्तर दिनुहोस्।",
+                "Question:\n{query}\n\nContext:\n{document}\n\n"
+                "Answer in Nepali only using the context above.",
             ),
         ]
     )
-    generator   = answer_prompt | llm
-    generator_2 = answer_prompt | llm_2
-    generator_3 = answer_prompt | llm_3
 
-    log.info("RAG pipeline ready ✓")
+    generators = [answer_prompt | ChatGroq(model="llama-3.3-70b-versatile", api_key=key) for key in active_keys]
+    log.info("Initialized %d Groq generator(s)", len(generators))
 
 
-# ── API schemas ───────────────────────────────────────────────────────────────
-class QueryRequest(PydanticBaseModel):
-    question: str
-    top_k: Optional[int] = 3   # default k=3, matches notebook
-
-
-class QueryResponse(PydanticBaseModel):
-    question: str
-    hyde_passage: str
-    retrieved_docs: list[str]
-    answer_own_model: str      # Answer from fine-tuned SLM
-    answer_groq: str           # Answer from Groq LLM
-    processing_time: float
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
         "model": MODEL_ID,
         "device": device,
-        "has_vector_store": retriever is not None,
-        "has_llm": generator is not None,
+        "corpus_size": len(retrieval_corpus),
+        "has_vector_store": vector_store is not None,
+        "has_llm": bool(generators),
     }
 
 
 @app.post("/api/query", response_model=QueryResponse)
 def query(req: QueryRequest):
-    if generator is None or retriever is None or model is None:
+    if model is None or vector_store is None or not generators:
         raise HTTPException(status_code=503, detail="Pipeline not ready yet")
 
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
     t0 = time.perf_counter()
+    top_k = max(1, min(req.top_k or 3, 6))
 
-    # Step 1 — HyDE: local SLM generates a hypothetical legal passage
-    hyde_passage = generate_hyde_document(req.question)
+    hyde_passage = generate_hyde_document(question)
+    docs = retrieve_documents(question, hyde_passage, top_k=top_k)
+    if not docs:
+        raise HTTPException(status_code=500, detail="No documents were retrieved from the corpus")
 
-    # Step 2 — Retrieval: embed HyDE passage, search FAISS
-    top_k = max(1, min(req.top_k or 3, 8))
-    docs = retrieve_documents(req.question, hyde_passage, top_k=top_k)
-    context = [doc.page_content for doc in docs]
-    formatted_context = _format_context_blocks(docs)
+    context_strings = [doc.page_content for doc in docs]
+    formatted_context = format_context_blocks(docs)
 
-    # Step 3a — Answer from own model (fine-tuned SLM)
     try:
-        answer_own = generate_answer_from_slm(req.question, docs)
-        log.info("Own model answer generated ✓")
-    except Exception as e:
-        log.error(f"Error generating answer from own model: {e}")
-        answer_own = f"Error: {str(e)}"
+        answer_own = generate_answer_from_slm(question, docs)
+    except Exception as exc:
+        log.exception("Local SLM answer generation failed")
+        answer_own = f"Local SLM error: {exc}"
 
-    # Step 3b — Answer from Groq (round-robin across API keys)
-    i = request_counter[0]
+    generator = generators[request_counter[0] % len(generators)]
     request_counter[0] += 1
 
-    groq_generators = [generator, generator_2, generator_3]
-    active_generator = groq_generators[i % len(groq_generators)]
-    response = active_generator.invoke({"document": formatted_context, "query": req.question})
+    try:
+        groq_response = generator.invoke({"document": formatted_context, "query": question})
+        answer_groq = groq_response.content
+    except Exception as exc:
+        log.exception("Groq answer generation failed")
+        answer_groq = f"Groq error: {exc}"
 
-    answer_groq = response.content
-
-    processing_time = round(time.perf_counter() - t0, 2)
     return QueryResponse(
-        question=req.question,
+        question=question,
         hyde_passage=hyde_passage,
-        retrieved_docs=context,
+        retrieved_docs=context_strings,
         answer_own_model=answer_own,
         answer_groq=answer_groq,
-        processing_time=processing_time,
+        processing_time=round(time.perf_counter() - t0, 2),
     )
