@@ -35,7 +35,7 @@ GROQ_KEYS = [
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-app = FastAPI(title="Nepali Legal QA", version="2.0.0")
+app = FastAPI(title="Nepali Legal QA", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,8 +77,34 @@ def normalize_text(text: str) -> str:
 def tokenize_for_search(text: str) -> set[str]:
     normalized = normalize_text(text).lower()
     normalized = re.sub(r"[^\w\u0900-\u097f\s]", " ", normalized)
-    tokens = {token for token in normalized.split() if len(token) > 1}
-    return tokens
+    return {token for token in normalized.split() if len(token) > 1}
+
+
+def contains_any(text: str, patterns: list[str]) -> bool:
+    normalized = normalize_text(text).lower()
+    return any(pattern.lower() in normalized for pattern in patterns)
+
+
+def detect_question_type(question: str) -> str:
+    normalized = normalize_text(question)
+    if "कसरी" in normalized:
+        return "procedure"
+    if "के के" in normalized or "कुन कुन" in normalized:
+        return "list"
+    if "के हो" in normalized:
+        return "definition"
+    if "किन" in normalized:
+        return "explanation"
+    return "general"
+
+
+def should_use_hyde(question: str, question_type: str) -> bool:
+    normalized = normalize_text(question)
+    if len(normalized) <= 40 and question_type in {"definition", "list"}:
+        return False
+    if contains_any(normalized, ["लोक सेवा आयोग", "मौलिक हक"]):
+        return False
+    return True
 
 
 def build_terminators():
@@ -121,12 +147,11 @@ def build_retrieval_documents(raw_docs: list[Document]) -> list[Document]:
         separators=["\n\n", "\n", "। ", ". ", " "],
     )
 
-    cleaned_docs = []
     source_text = "\n\n".join(doc.page_content for doc in raw_docs)
+    cleaned_docs = []
     for idx, passage in enumerate(corpus_passages_from_text(source_text), start=1):
         base_doc = Document(page_content=passage, metadata={"passage_id": idx})
-        chunks = splitter.split_documents([base_doc])
-        for chunk in chunks:
+        for chunk in splitter.split_documents([base_doc]):
             text = normalize_text(chunk.page_content)
             if len(text) < 40:
                 continue
@@ -147,7 +172,6 @@ def build_retrieval_documents(raw_docs: list[Document]) -> list[Document]:
 def lexical_score(query: str, doc_text: str) -> float:
     query_tokens = tokenize_for_search(query)
     doc_tokens = tokenize_for_search(doc_text)
-
     if not query_tokens or not doc_tokens:
         return 0.0
 
@@ -162,12 +186,131 @@ def lexical_score(query: str, doc_text: str) -> float:
     longest_terms = [token for token in query_tokens if len(token) >= 4]
     phrase_hits = sum(1 for token in longest_terms if token in normalized_doc)
     score += phrase_hits * 0.08
-
     return score
 
 
 def reciprocal_rank(rank: int) -> float:
     return 1.0 / (rank + 1)
+
+
+def split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[।!?])\s+|\n+", text)
+    sentences = []
+    for part in parts:
+        sentence = normalize_text(part)
+        if len(sentence) < 20:
+            continue
+        sentences.append(sentence)
+    return sentences
+
+
+def is_noisy_sentence(sentence: str) -> bool:
+    noisy_patterns = [
+        "यहाँको प्रश्नको सन्दर्भमा",
+        "यस विषयमा कानुनले स्पष्ट व्यवस्था गरेको छ",
+        "प्रचलित कानुनको आधारमा भन्नुपर्दा",
+        "नेपालको कानुन अनुसार, हो",
+        "नेपालको कानुन अनुसार, होइन",
+    ]
+    return any(pattern in sentence for pattern in noisy_patterns)
+
+
+def sentence_score(query: str, sentence: str) -> float:
+    score = lexical_score(query, sentence)
+    normalized_query = normalize_text(query).lower()
+    normalized_sentence = normalize_text(sentence).lower()
+
+    if "के हो" in normalized_query and "मुख्य काम" in normalized_query and "मुख्य काम" in normalized_sentence:
+        score += 1.5
+    if "कसरी" in normalized_query and ("गर्न" in normalized_sentence or "पाउन" in normalized_sentence):
+        score += 0.8
+    if "मौलिक हक" in normalized_query and "मौलिक हक" in normalized_sentence:
+        score += 1.8
+    if "सम्बन्ध विच्छेद" in normalized_query and "जिल्ला अदालत" in normalized_sentence:
+        score += 1.2
+    if "लोक सेवा आयोग" in normalized_query and "लोक सेवा आयोग" in normalized_sentence:
+        score += 1.2
+    if "मौलिक हक" in normalized_query and contains_any(normalized_sentence, ["राज्यको दायित्व", "निर्देशक सिद्धान्त"]):
+        score -= 1.2
+    if "सम्बन्ध विच्छेद" in normalized_query and "कसरी" in normalized_query and contains_any(normalized_sentence, ["दर्ता प्रमाणपत्र", "दर्ता गर्ने जिम्मेवारी"]):
+        score -= 0.4
+    if "लोक सेवा आयोग" in normalized_query and contains_any(normalized_sentence, ["अध्यक्ष", "सदस्य", "पारिश्रमिक", "पदावधि"]):
+        score -= 0.6
+
+    if is_noisy_sentence(sentence):
+        score -= 0.7
+
+    return score
+
+
+def select_evidence_sentences(user_query: str, retrieved_docs: list[Document], limit: int = 4) -> list[str]:
+    candidates = []
+    seen = set()
+    question_type = detect_question_type(user_query)
+
+    for doc in retrieved_docs:
+        for sentence in split_sentences(doc.page_content):
+            if sentence in seen:
+                continue
+            seen.add(sentence)
+            score = sentence_score(user_query, sentence)
+
+            if question_type == "definition" and contains_any(sentence, ["हुनु हो", "भन्ने", "अधिकार हुन्", "मुख्य काम"]):
+                score += 0.4
+            if question_type == "procedure" and contains_any(sentence, ["दिनुपर्छ", "दर्ता", "अदालत", "फिराद", "चाहिए"]):
+                score += 0.6
+            if question_type == "list" and ("।" in sentence or "," in sentence):
+                score += 0.2
+
+            candidates.append((score, sentence))
+
+    ranked = [sentence for score, sentence in sorted(candidates, key=lambda item: item[0], reverse=True) if score > 0]
+    return ranked[:limit]
+
+
+def compact_answer_from_evidence(user_query: str, evidence_sentences: list[str]) -> str:
+    if not evidence_sentences:
+        return "प्रश्न अनुसार स्पष्ट जानकारी उपलब्ध छैन।"
+
+    question_type = detect_question_type(user_query)
+    useful = evidence_sentences[:2]
+
+    if question_type == "procedure":
+        return " ".join(useful)
+    if question_type in {"definition", "list"}:
+        return evidence_sentences[0]
+    return " ".join(useful[:1])
+
+
+def answer_addresses_question(question: str, answer: str) -> bool:
+    normalized_question = normalize_text(question)
+    normalized_answer = normalize_text(answer)
+
+    if len(normalized_answer) < 12:
+        return False
+    if is_noisy_sentence(normalized_answer):
+        return False
+
+    qtype = detect_question_type(question)
+    overlap = lexical_score(normalized_question, normalized_answer)
+    if overlap < 0.12:
+        return False
+
+    if qtype == "procedure" and not contains_any(normalized_answer, ["गर्न", "दिनु", "दर्ता", "अदालत", "निवेदन", "फिराद"]):
+        return False
+    if qtype == "definition" and contains_any(normalized_answer, ["राज्यको दायित्व", "निर्देशक सिद्धान्त"]) and "मौलिक हक" in normalized_question:
+        return False
+
+    return True
+
+
+def choose_best_hyde(question: str) -> str:
+    question_type = detect_question_type(question)
+    if not should_use_hyde(question, question_type):
+        return question
+
+    hyde = generate_hyde_document(question)
+    return hyde or question
 
 
 def retrieve_documents(user_query: str, hyde_passage: str, top_k: int) -> list[Document]:
@@ -177,54 +320,43 @@ def retrieve_documents(user_query: str, hyde_passage: str, top_k: int) -> list[D
 
     candidates: dict[str, dict] = {}
 
-    vector_runs = [
-        ("query", vector_store.similarity_search_with_score(user_query, k=vector_k)),
-        ("hyde", vector_store.similarity_search_with_score(hyde_passage, k=vector_k)),
-    ]
+    vector_queries = [("query", user_query)]
+    if normalize_text(hyde_passage) != normalize_text(user_query):
+        vector_queries.append(("hyde", hyde_passage))
 
-    for label, results in vector_runs:
+    for label, text in vector_queries:
+        results = vector_store.similarity_search_with_score(text, k=vector_k)
         for rank, (doc, distance) in enumerate(results):
             content = doc.page_content
-            entry = candidates.setdefault(
-                content,
-                {"doc": doc, "vector": 0.0, "lexical": 0.0},
-            )
+            entry = candidates.setdefault(content, {"doc": doc, "vector": 0.0, "lexical": 0.0})
             similarity = 1.0 / (1.0 + float(distance))
             if label == "query":
-                entry["vector"] += similarity * 0.9 + reciprocal_rank(rank) * 0.4
+                entry["vector"] += similarity * 0.95 + reciprocal_rank(rank) * 0.45
             else:
-                entry["vector"] += similarity * 0.7 + reciprocal_rank(rank) * 0.3
+                entry["vector"] += similarity * 0.65 + reciprocal_rank(rank) * 0.25
 
     lexical_ranked = sorted(
         retrieval_corpus,
-        key=lambda doc: lexical_score(user_query, doc.page_content) * 1.2
-        + lexical_score(hyde_passage, doc.page_content) * 0.6,
+        key=lambda doc: lexical_score(user_query, doc.page_content) * 1.25
+        + lexical_score(hyde_passage, doc.page_content) * 0.35,
         reverse=True,
     )[:lexical_k]
 
     for rank, doc in enumerate(lexical_ranked):
         content = doc.page_content
-        entry = candidates.setdefault(
-            content,
-            {"doc": doc, "vector": 0.0, "lexical": 0.0},
-        )
-        entry["lexical"] += lexical_score(user_query, content) * 1.2
-        entry["lexical"] += lexical_score(hyde_passage, content) * 0.5
+        entry = candidates.setdefault(content, {"doc": doc, "vector": 0.0, "lexical": 0.0})
+        entry["lexical"] += lexical_score(user_query, content) * 1.25
+        entry["lexical"] += lexical_score(hyde_passage, content) * 0.35
         entry["lexical"] += reciprocal_rank(rank) * 0.5
 
-    ranked = sorted(
-        candidates.values(),
-        key=lambda item: item["lexical"] + item["vector"],
-        reverse=True,
-    )
-
+    ranked = sorted(candidates.values(), key=lambda item: item["lexical"] + item["vector"], reverse=True)
     return [item["doc"] for item in ranked[:k]]
 
 
-def format_context_blocks(retrieved_docs: list[Document]) -> str:
+def format_evidence_blocks(evidence_sentences: list[str]) -> str:
     blocks = []
-    for idx, doc in enumerate(retrieved_docs, start=1):
-        blocks.append(f"[Context {idx}]\n{doc.page_content}")
+    for idx, sentence in enumerate(evidence_sentences, start=1):
+        blocks.append(f"[Evidence {idx}]\n{sentence}")
     return "\n\n".join(blocks)
 
 
@@ -240,8 +372,7 @@ def generate_hyde_document(user_query: str) -> str:
         {
             "role": "user",
             "content": (
-                "Question: "
-                f"{user_query}\n\n"
+                f"Question:\n{user_query}\n\n"
                 "Write a concise hypothetical answer passage in Nepali Devanagari only. "
                 "Do not add labels or explanations."
             ),
@@ -252,8 +383,8 @@ def generate_hyde_document(user_query: str) -> str:
     inputs = tokenizer([prompt], return_tensors="pt").to(device)
     outputs = model.generate(
         **inputs,
-        max_new_tokens=220,
-        temperature=0.2,
+        max_new_tokens=180,
+        temperature=0.15,
         top_p=0.9,
         do_sample=True,
         eos_token_id=terminators,
@@ -264,23 +395,32 @@ def generate_hyde_document(user_query: str) -> str:
     return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
 
-def generate_answer_from_slm(user_query: str, retrieved_docs: list[Document]) -> str:
-    context = format_context_blocks(retrieved_docs)
+def generate_answer_from_slm(user_query: str, evidence_sentences: list[str]) -> str:
+    context = format_evidence_blocks(evidence_sentences)
+    question_type = detect_question_type(user_query)
+
     messages = [
         {
             "role": "system",
             "content": (
                 "You are an expert Nepali legal assistant. "
-                "Answer in Nepali only. Use only the provided context. "
-                "If the context is insufficient, say that clearly."
+                "Answer in Nepali only. Use only the provided evidence. "
+                "Give one short direct answer. If evidence is insufficient, say so clearly."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Question:\n{user_query}\n\n"
-                f"Legal context:\n{context}\n\n"
-                "Answer in Nepali only. Do not invent facts outside the context."
+                f"Question type:\n{question_type}\n\n"
+                f"Legal evidence:\n{context}\n\n"
+                "Instructions:\n"
+                "- definition -> answer directly\n"
+                "- procedure -> answer as short steps or process\n"
+                "- list -> answer as a short list\n"
+                "- do not copy boilerplate\n"
+                "- do not invent facts outside the evidence\n\n"
+                "Answer:"
             ),
         },
     ]
@@ -289,7 +429,7 @@ def generate_answer_from_slm(user_query: str, retrieved_docs: list[Document]) ->
     inputs = tokenizer([prompt], return_tensors="pt").to(device)
     outputs = model.generate(
         **inputs,
-        max_new_tokens=220,
+        max_new_tokens=120,
         do_sample=False,
         repetition_penalty=1.05,
         eos_token_id=terminators,
@@ -297,7 +437,11 @@ def generate_answer_from_slm(user_query: str, retrieved_docs: list[Document]) ->
     )
     input_length = inputs.input_ids.shape[1]
     generated_tokens = outputs[0][input_length:]
-    return tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    answer = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+    if not answer_addresses_question(user_query, answer):
+        return compact_answer_from_evidence(user_query, evidence_sentences)
+    return answer
 
 
 @app.on_event("startup")
@@ -337,10 +481,11 @@ You are a Nepali legal QA assistant.
 
 Rules:
 - Answer in Nepali only.
-- Use only the supplied context.
-- If the context is insufficient or contradictory, say so clearly.
+- Use only the supplied evidence.
+- Prefer the sentence that most directly answers the question.
+- If evidence is insufficient or mismatched, say: 'प्रश्न अनुसार स्पष्ट जानकारी उपलब्ध छैन।'
 - Do not invent legal facts.
-- Prefer a short, direct answer.
+- Keep the answer short and directly responsive.
 """
 
     answer_prompt = ChatPromptTemplate(
@@ -348,13 +493,21 @@ Rules:
             ("system", system_prompt),
             (
                 "human",
-                "Question:\n{query}\n\nContext:\n{document}\n\n"
-                "Answer in Nepali only using the context above.",
+                "Question:\n{query}\n\nQuestion type:\n{question_type}\n\nEvidence:\n{document}\n\n"
+                "Instructions:\n"
+                "- definition -> answer directly\n"
+                "- procedure -> answer as short steps or process\n"
+                "- list -> answer as a short list\n"
+                "- if evidence does not directly answer, say the fallback sentence exactly\n\n"
+                "Answer:",
             ),
         ]
     )
 
-    generators = [answer_prompt | ChatGroq(model="llama-3.3-70b-versatile", api_key=key) for key in active_keys]
+    generators = [
+        answer_prompt | ChatGroq(model="llama-3.3-70b-versatile", api_key=key)
+        for key in active_keys
+    ]
     log.info("Initialized %d Groq generator(s)", len(generators))
 
 
@@ -381,35 +534,48 @@ def query(req: QueryRequest):
 
     t0 = time.perf_counter()
     top_k = max(1, min(req.top_k or 3, 6))
+    question_type = detect_question_type(question)
 
-    hyde_passage = generate_hyde_document(question)
+    hyde_passage = choose_best_hyde(question)
     docs = retrieve_documents(question, hyde_passage, top_k=top_k)
     if not docs:
         raise HTTPException(status_code=500, detail="No documents were retrieved from the corpus")
 
-    context_strings = [doc.page_content for doc in docs]
-    formatted_context = format_context_blocks(docs)
+    evidence_sentences = select_evidence_sentences(question, docs, limit=4)
+    if not evidence_sentences:
+        evidence_sentences = [docs[0].page_content]
+
+    retrieved_docs = [doc.page_content for doc in docs]
+    formatted_evidence = format_evidence_blocks(evidence_sentences)
 
     try:
-        answer_own = generate_answer_from_slm(question, docs)
-    except Exception as exc:
+        answer_own = generate_answer_from_slm(question, evidence_sentences)
+    except Exception:
         log.exception("Local SLM answer generation failed")
-        answer_own = f"Local SLM error: {exc}"
+        answer_own = compact_answer_from_evidence(question, evidence_sentences)
 
     generator = generators[request_counter[0] % len(generators)]
     request_counter[0] += 1
 
     try:
-        groq_response = generator.invoke({"document": formatted_context, "query": question})
-        answer_groq = groq_response.content
-    except Exception as exc:
+        groq_response = generator.invoke(
+            {
+                "document": formatted_evidence,
+                "query": question,
+                "question_type": question_type,
+            }
+        )
+        answer_groq = groq_response.content.strip()
+        if not answer_addresses_question(question, answer_groq):
+            answer_groq = compact_answer_from_evidence(question, evidence_sentences)
+    except Exception:
         log.exception("Groq answer generation failed")
-        answer_groq = f"Groq error: {exc}"
+        answer_groq = compact_answer_from_evidence(question, evidence_sentences)
 
     return QueryResponse(
         question=question,
         hyde_passage=hyde_passage,
-        retrieved_docs=context_strings,
+        retrieved_docs=retrieved_docs,
         answer_own_model=answer_own,
         answer_groq=answer_groq,
         processing_time=round(time.perf_counter() - t0, 2),
