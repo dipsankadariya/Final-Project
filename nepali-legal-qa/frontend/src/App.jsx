@@ -232,24 +232,7 @@ export default function App() {
     }
   }, [])
 
-  const handleLogout = () => {
-    localStorage.removeItem('auth_token')
-    localStorage.removeItem('user_info')
-    setUser(null)
-    setQuestion('')
-    setResult(null)
-    setHistory([])
-  }
-
-  const handleLoginSuccess = (data) => {
-    setUser(data.user)
-  }
-
-  // Show login screen if not authenticated
-  if (!user) {
-    return <LoginCard onLoginSuccess={handleLoginSuccess} />
-  }
-
+  // All other hooks must come BEFORE the conditional render
   useEffect(() => {
     const ta = textareaRef.current
     if (!ta) return
@@ -290,6 +273,24 @@ export default function App() {
     }
   }
 
+  const handleLogout = () => {
+    localStorage.removeItem('auth_token')
+    localStorage.removeItem('user_info')
+    setUser(null)
+    setQuestion('')
+    setResult(null)
+    setHistory([])
+  }
+
+  const handleLoginSuccess = (data) => {
+    setUser(data.user)
+  }
+
+  // NOW show login screen if not authenticated (after all hooks)
+  if (!user) {
+    return <LoginCard onLoginSuccess={handleLoginSuccess} />
+  }
+
   return (
     <div className="min-h-screen bg-[#f8f7ff] flex flex-col">
       <header className="bg-white border-b border-purple-100 sticky top-0 z-10 shadow-sm shadow-purple-50">
@@ -303,7 +304,7 @@ export default function App() {
             <span className="text-sm font-semibold text-gray-900">नेपाली कानूनी सहायक</span>
             <span className="hidden sm:block text-xs text-gray-300">/ Baseline vs HyDE RAG</span>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-4">
             <div className="flex items-center gap-1.5 text-[11px] text-purple-500 font-medium bg-purple-50 border border-purple-100 rounded-full px-3 py-1">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
               <span className="hidden sm:block">Baseline RAG • HyDE RAG • FAISS</span>
