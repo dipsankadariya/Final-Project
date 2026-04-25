@@ -1,14 +1,22 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { LoginCard, UserProfile } from './GoogleLogin'
 
 const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '')
 
 async function queryLegal(question, topK = 5) {
   const endpoint = API_BASE ? `${API_BASE}/api/query` : '/api/query'
+  const token = localStorage.getItem('auth_token')
+  const headers = {
+    'Content-Type': 'application/json',
+  }
+  
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`
+  }
+
   const res = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({ question, top_k: topK }),
   })
   if (!res.ok) {
@@ -205,8 +213,42 @@ export default function App() {
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [history, setHistory] = useState([])
+  const [user, setUser] = useState(null)
   const textareaRef = useRef(null)
   const resultsRef = useRef(null)
+
+  // Load user info from localStorage on mount
+  useEffect(() => {
+    const token = localStorage.getItem('auth_token')
+    const userInfo = localStorage.getItem('user_info')
+    if (token && userInfo) {
+      try {
+        setUser(JSON.parse(userInfo))
+      } catch (e) {
+        console.error('Failed to parse user info:', e)
+        localStorage.removeItem('auth_token')
+        localStorage.removeItem('user_info')
+      }
+    }
+  }, [])
+
+  const handleLogout = () => {
+    localStorage.removeItem('auth_token')
+    localStorage.removeItem('user_info')
+    setUser(null)
+    setQuestion('')
+    setResult(null)
+    setHistory([])
+  }
+
+  const handleLoginSuccess = (data) => {
+    setUser(data.user)
+  }
+
+  // Show login screen if not authenticated
+  if (!user) {
+    return <LoginCard onLoginSuccess={handleLoginSuccess} />
+  }
 
   useEffect(() => {
     const ta = textareaRef.current
@@ -261,9 +303,12 @@ export default function App() {
             <span className="text-sm font-semibold text-gray-900">नेपाली कानूनी सहायक</span>
             <span className="hidden sm:block text-xs text-gray-300">/ Baseline vs HyDE RAG</span>
           </div>
-          <div className="flex items-center gap-1.5 text-[11px] text-purple-500 font-medium bg-purple-50 border border-purple-100 rounded-full px-3 py-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            <span className="hidden sm:block">Baseline RAG • HyDE RAG • FAISS</span>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5 text-[11px] text-purple-500 font-medium bg-purple-50 border border-purple-100 rounded-full px-3 py-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              <span className="hidden sm:block">Baseline RAG • HyDE RAG • FAISS</span>
+            </div>
+            {user && <UserProfile user={user} onLogout={handleLogout} />}
           </div>
         </div>
       </header>

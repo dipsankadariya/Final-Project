@@ -29,3 +29,9 @@ datasets>=3.1.0
 numpy>=1.26.0
 pyngrok
 python-dotenv>=1.0.0
+
+# ── Authentication ─────────────────────────────────────────────
+google-auth-oauthlib>=1.2.0
+google-auth>=2.28.0
+python-jose[cryptography]>=3.3.0
+PyJWT>=2.8.1

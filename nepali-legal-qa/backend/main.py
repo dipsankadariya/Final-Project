@@ -4,7 +4,7 @@ import time
 from typing import Optional
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.document_loaders import TextLoader
 from langchain_community.vectorstores import FAISS
@@ -14,6 +14,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from auth import Token, TokenData, create_access_token, verify_access_token, verify_google_token
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -206,8 +208,73 @@ def health():
     }
 
 
+class GoogleTokenRequest(BaseModel):
+    token: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: TokenData
+
+
+@app.post("/api/auth/google", response_model=AuthResponse)
+def google_login(req: GoogleTokenRequest):
+    """Login with Google OAuth2 token."""
+    try:
+        token_data = verify_google_token(req.token)
+        access_token = create_access_token({
+            "sub": token_data.sub,
+            "email": token_data.email,
+            "name": token_data.name,
+            "picture": token_data.picture,
+        })
+        return AuthResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=token_data
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.get("/api/auth/verify")
+def verify_token(authorization: Optional[str] = Header(None)):
+    """Verify and get current user info from token."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    
+    try:
+        # Extract token from "Bearer <token>"
+        parts = authorization.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+        
+        token = parts[1]
+        user = verify_access_token(token)
+        return {"user": user}
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> TokenData:
+    """Dependency to verify token and get current user."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing authorization header")
+    
+    try:
+        parts = authorization.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+        
+        token = parts[1]
+        return verify_access_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
 @app.post("/api/query", response_model=QueryResponse)
-def query(req: QueryRequest):
+def query(req: QueryRequest, authorization: Optional[str] = Header(None)):
     if model is None or vector_store is None or not generators:
         raise HTTPException(status_code=503, detail="Pipeline not ready yet")
 
