@@ -66,6 +66,8 @@ class QueryResponse(BaseModel):
     hyde_retrieved_docs: list[str]
     baseline_answer: str
     hyde_answer: str
+    baseline_answer_in_english: str  
+    hyde_answer_in_english: str
     processing_time: float
 
 
