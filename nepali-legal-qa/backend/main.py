@@ -414,6 +414,6 @@ def query(req: QueryRequest, authorization: Optional[str] = Header(None)):
         baseline_answer=baseline_answer,
         hyde_answer=hyde_answer,
         baseline_answer_in_english=baseline_answer_in_english,
-        hyde_answer_in_english=hyde_answer_in_english
+        hyde_answer_in_english=hyde_answer_in_english,
         processing_time=round(time.perf_counter() - t0, 2),
     )
