@@ -127,7 +127,7 @@ function DocsCard({ docs, badge, badgeClass, label }) {
 
 function AnswerCard({ title, label, answer, bgGradient, icon }) {
   return (
-    <div className="rounded-xl overflow-hidden border border-purple-200 shadow-md shadow-purple-100 bg-white">
+    <div className="rounded-xl overflow-hidden border border-purple-200 shadow-md shadow-purple-100 bg-white h-full flex flex-col">
       <div className={`flex items-center gap-3 px-4 py-3 ${bgGradient}`}>
         <span className="text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded-md bg-white/20 text-white border border-white/25 flex-shrink-0">
           {title}
@@ -137,7 +137,7 @@ function AnswerCard({ title, label, answer, bgGradient, icon }) {
           {icon}
         </svg>
       </div>
-      <div className="p-5 text-sm leading-[1.9] text-gray-800">
+      <div className="p-5 text-sm leading-[1.9] text-gray-800 flex-1 overflow-auto">
         <ReactMarkdown 
           remarkPlugins={[remarkGfm]}
           components={{
@@ -160,20 +160,24 @@ function AnswerCard({ title, label, answer, bgGradient, icon }) {
   )
 }
 
-function ComparisonCard({ baselineAnswer, hydeAnswer }) {
+function ComparisonCard({ baselineAnswer, hydeAnswer, baselineEnglish, hydeEnglish, showEnglish }) {
+  // Select which string to show based on the toggle state
+  const displayBaseline = showEnglish && baselineEnglish ? baselineEnglish : baselineAnswer;
+  const displayHyde = showEnglish && hydeEnglish ? hydeEnglish : hydeAnswer;
+
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 items-stretch">
       <AnswerCard
         title="Baseline"
         label="Standard RAG retrieval"
-        answer={baselineAnswer}
+        answer={displayBaseline}
         icon={<path d="M12 1L3 5v6c0 5.25 3.75 10.15 9 11.35C17.25 21.15 21 16.25 21 11V5L12 1z" />}
         bgGradient="bg-gradient-to-r from-orange-600 to-amber-600"
       />
       <AnswerCard
         title="HyDE"
         label="SLM-generated HyDE retrieval"
-        answer={hydeAnswer}
+        answer={displayHyde}
         icon={<path d="M12 2l2.4 7.6H22l-6.2 4.5 2.4 7.5L12 17.1l-6.2 4.5 2.4-7.5L2 9.6h7.6z" />}
         bgGradient="bg-gradient-to-r from-purple-600 to-violet-600"
       />
@@ -232,6 +236,10 @@ export default function App() {
   const [error, setError] = useState(null)
   const [history, setHistory] = useState([])
   const [user, setUser] = useState(null)
+  
+  // NEW: State to manage the translation toggle
+  const [showEnglish, setShowEnglish] = useState(false)
+  
   const textareaRef = useRef(null)
   const resultsRef = useRef(null)
 
@@ -265,7 +273,9 @@ export default function App() {
     setLoading(true)
     setError(null)
     setResult(null)
+    setShowEnglish(false) // Reset translation toggle on new query
     setPhase('hyde')
+    
     const t1 = setTimeout(() => setPhase('retrieve'), 3000)
     const t2 = setTimeout(() => setPhase('answer'), 7000)
     try {
@@ -298,6 +308,7 @@ export default function App() {
     setQuestion('')
     setResult(null)
     setHistory([])
+    setShowEnglish(false)
   }
 
   const handleLoginSuccess = (data) => {
@@ -461,7 +472,30 @@ export default function App() {
                 badgeClass="bg-emerald-50 text-emerald-600 border-emerald-100"
                 label={`${result.hyde_retrieved_docs.length} passages retrieved by HyDE-enhanced RAG`}
               />
-              <ComparisonCard baselineAnswer={result.baseline_answer} hydeAnswer={result.hyde_answer} />
+              
+              {/* Added Translation Toggle UI */}
+              <div className="flex items-center justify-end mt-4 mb-2 pr-1">
+                <button
+                  onClick={() => setShowEnglish(!showEnglish)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-white border border-purple-200 text-purple-700 hover:bg-purple-50 transition-colors shadow-sm"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="2" y1="12" x2="22" y2="12"></line>
+                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                  </svg>
+                  {showEnglish ? 'View Original in Nepali' : 'Translate to English'}
+                </button>
+              </div>
+
+              {/* Updated Comparison Card passing the new props */}
+              <ComparisonCard 
+                baselineAnswer={result.baseline_answer} 
+                hydeAnswer={result.hyde_answer} 
+                baselineEnglish={result.baseline_answer_in_english}
+                hydeEnglish={result.hyde_answer_in_english}
+                showEnglish={showEnglish}
+              />
             </div>
           )}
 

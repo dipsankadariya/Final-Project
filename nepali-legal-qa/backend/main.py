@@ -47,7 +47,9 @@ app.add_middleware(
 tokenizer = None
 model = None
 vector_store = None
+answer_generators=[]
 generators = []
+english_answer_generators=[]
 terminators = None
 request_counter = [0]
 
@@ -138,10 +140,29 @@ def generate_answer_from_docs(question: str, docs: list, generator) -> str:
     )
     return response.content.strip()
 
+def generate_hyde_answer_final(question:str, answer,generator)->str:
+    response=generator.invoke(
+        {
+            "query":question,
+            "answer":answer,
+        }
+    )
+    return response.content.strip()
+
+
+def generate_english_answer(question:str,answer:str,generator)->str:
+    response=generator.invoke(
+        {
+            "query":question,
+            "answer":answer
+        }
+    )
+    return response.content.strip()
+
 
 @app.on_event("startup")
 def load_models():
-    global tokenizer, model, vector_store, generators, terminators
+    global tokenizer, model, vector_store, generators, terminators, answer_generators, english_answer_generators
 
     log.info("Device: %s", device)
 
@@ -182,20 +203,84 @@ Rules:
 - Use the provided context as the basis of the answer.
 - If the context is insufficient, say so clearly.
 - Prefer a direct, complete answer.
-- In your final answer please include the name of the law or the ain.
 """
     answer_prompt = ChatPromptTemplate(
         [
             ("system", system_prompt),
-            ("human", "Generate the best answer on the basis of this {document} for user query: {query}. Also include the best suitable ain and law that the document represent in the final answer."),
+            ("human", "Generate the best answer on the basis of this {document} for user query: {query}."),
         ]
     )
 
-    generators = [
+    answer_generators = [
         answer_prompt | ChatGroq(model="openai/gpt-oss-120b", api_key=key)
         for key in active_keys
     ]
+    log.info("Initialized %d answer generator(s)", len(answer_generators))
+    
+    system_prompt_2 = """
+You are an expert Nepali legal assistant with comprehensive knowledge of Nepal's Constitution, Acts (ऐन), Regulations (नियमावली), and legal precedents.
+
+Your task is to receive a user query and a draft answer, then produce a refined, authoritative final answer in Nepali.
+
+Follow these rules strictly:
+
+1. **Always answer** — Even if the draft answer says "थाहा छैन", "सन्दर्भ छैन", or similar, you must still provide the best possible legal answer using your own knowledge.
+
+2. **Always cite sources** — Every answer must include:
+   - नेपालको संविधान (भाग, धारा, उपधारा) — if applicable
+   - सम्बन्धित ऐन/कानुन (नाम र दफा नम्बर सहित)
+   - सम्बन्धित नियमावली वा विनियम — if applicable
+
+3. **Answer structure** — Always follow this format:
+   - **सिधा जवाफ:** (Direct answer in 1–2 sentences)
+   - **विस्तृत विवरण:** (Detailed explanation)
+   - **कानुनी आधार:** (Legal basis — cite Constitution articles, ऐन, दफा)
+
+4. **Language** — Answer entirely in Nepali. Use clear, simple Nepali that a common citizen can understand, while keeping legal terms accurate.
+
+5. **Accuracy** — Do not fabricate laws. If a specific दफा number is uncertain, cite the ऐन by name and describe the relevant provision.
+
+6. **Completeness** — Never give a partial or vague answer. A citizen relying on this answer must get actionable legal guidance.
+"""
+    answer_prompt_2 = ChatPromptTemplate(
+        [
+            ("system", system_prompt_2),
+            ("human", "Generate the best refined answer on the basis of this {answer} for user query: {query}."),
+        ]
+    )
+    
+    generators=[
+        answer_prompt_2 | ChatGroq(model="openai/gpt-oss-120b", api_key=key)
+        for key in active_keys
+    ]
     log.info("Initialized %d answer generator(s)", len(generators))
+    
+    
+    system_prompt_3="""
+    You are a legal assistant specializing in Nepal law. You will receive a question and an answer, both written in Nepali, related to a Nepal legal query.
+
+Your task is to produce a clear, professional English response that:
+- Accurately conveys the legal meaning of the original Nepali answer
+- Uses proper legal terminology applicable to Nepal's legal system (reference relevant Acts, Codes, or Constitutional provisions where appropriate)
+- Is structured logically: start with a direct answer, followed by explanation and legal basis
+- Remains accessible to a non-lawyer while maintaining legal accuracy
+- Is concise yet complete — avoid padding, but omit nothing legally significant
+
+Do not add opinions, assumptions, or information not present in the original answer. If the answer references specific Nepali laws (e.g., Muluki Civil Code 2074, Labor Act 2074), retain and translate those references accurately.
+
+Output only the English answer — no commentary, no preamble. 
+"""
+    answer_prompt_3=ChatPromptTemplate(
+        ("system",system_prompt_3),
+        ("human","Generate the best  english refined answer on the basis of this nepali {answer} for user nepali query: {query}.")
+    )
+    
+    english_answer_generators=[
+        answer_prompt_3 | ChatGroq(model="openai/gpt-oss-120b",api_key=key)
+        for key in active_keys
+    ]
+    
+    
 
 
 @app.get("/api/health")
@@ -246,7 +331,6 @@ def verify_token(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Missing authorization header")
     
     try:
-        # Extract token from "Bearer <token>"
         parts = authorization.split()
         if len(parts) != 2 or parts[0].lower() != "bearer":
             raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -293,21 +377,34 @@ def query(req: QueryRequest, authorization: Optional[str] = Header(None)):
 
     if not baseline_docs or not hyde_docs:
         raise HTTPException(status_code=500, detail="Document retrieval failed")
-
-    generator = generators[request_counter[0] % len(generators)]
+    
+    idx=request_counter[0] % len(generators)
     request_counter[0] += 1
+    current_answer_generator=answer_generators[idx]
+    current_generator=generators[idx]
+    current_english_answer_generator=english_answer_generators[idx]
+
+    
 
     try:
-        baseline_answer = generate_answer_from_docs(question, baseline_docs, generator)
+        baseline_answer = generate_answer_from_docs(question, baseline_docs, current_answer_generator)
     except Exception as exc:
         log.exception("Baseline answer generation failed")
         baseline_answer = f"Baseline answer error: {exc}"
 
     try:
-        hyde_answer = generate_answer_from_docs(question, hyde_docs, generator)
+        base_answer = generate_answer_from_docs(question, hyde_docs, current_answer_generator)
+        hyde_answer=generate_hyde_answer_final(question,base_answer,current_generator)
     except Exception as exc:
         log.exception("HyDE answer generation failed")
         hyde_answer = f"HyDE answer error: {exc}"
+        
+    try:
+        baseline_answer_in_english=generate_english_answer(question,baseline_answer,current_english_answer_generator)
+        hyde_answer_in_english=generate_english_answer(question,hyde_answer,current_english_answer_generator)
+    except Exception as exc:
+        log.exception("English answer generation failed")
+        hyde_answer_in_english=f"Error for english answer generator:{exc}"
 
     return QueryResponse(
         question=question,
@@ -316,5 +413,7 @@ def query(req: QueryRequest, authorization: Optional[str] = Header(None)):
         hyde_retrieved_docs=[doc.page_content for doc in hyde_docs],
         baseline_answer=baseline_answer,
         hyde_answer=hyde_answer,
+        baseline_answer_in_english=baseline_answer_in_english,
+        hyde_answer_in_english=hyde_answer_in_english
         processing_time=round(time.perf_counter() - t0, 2),
     )
