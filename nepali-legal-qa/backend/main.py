@@ -182,16 +182,17 @@ Rules:
 - Use the provided context as the basis of the answer.
 - If the context is insufficient, say so clearly.
 - Prefer a direct, complete answer.
+- In your final answer please include the name of the law or the ain.
 """
     answer_prompt = ChatPromptTemplate(
         [
             ("system", system_prompt),
-            ("human", "Generate the best answer on the basis of this {document} for user query: {query}"),
+            ("human", "Generate the best answer on the basis of this {document} for user query: {query}. Also include the best suitable ain and law that the document represent in the final answer."),
         ]
     )
 
     generators = [
-        answer_prompt | ChatGroq(model="llama-3.3-70b-versatile", api_key=key)
+        answer_prompt | ChatGroq(model="openai/gpt-oss-120b", api_key=key)
         for key in active_keys
     ]
     log.info("Initialized %d answer generator(s)", len(generators))
