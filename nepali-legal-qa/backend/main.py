@@ -272,13 +272,15 @@ Do not add opinions, assumptions, or information not present in the original ans
 
 Output only the English answer — no commentary, no preamble. 
 """
-    answer_prompt_3=ChatPromptTemplate(
-        ("system",system_prompt_3),
-        ("human","Generate the best  english refined answer on the basis of this nepali {answer} for user nepali query: {query}.")
+    answer_prompt_3 = ChatPromptTemplate(
+        [
+            ("system", system_prompt_3),
+            ("human", "Generate the best english refined answer on the basis of this nepali {answer} for user nepali query: {query}."),
+        ]
     )
     
-    english_answer_generators=[
-        answer_prompt_3 | ChatGroq(model="openai/gpt-oss-120b",api_key=key)
+    english_answer_generators = [
+        answer_prompt_3 | ChatGroq(model="openai/gpt-oss-120b", api_key=key)
         for key in active_keys
     ]
     
