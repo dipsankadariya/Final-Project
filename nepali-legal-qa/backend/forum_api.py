@@ -27,13 +27,13 @@ class ForumAuthor(BaseModel):
 
 
 class QuestionCreate(BaseModel):
-    title: str = Field(min_length=8, max_length=140)
-    body: str = Field(min_length=20, max_length=4000)
+    title: str = Field(min_length=1, max_length=140)
+    body: Optional[str] = Field(default=None, max_length=4000)
     tags: list[str] = Field(default_factory=list, max_length=6)
 
 
 class AnswerCreate(BaseModel):
-    body: str = Field(min_length=10, max_length=4000)
+    body: str = Field(min_length=1, max_length=2000)
 
 
 class VoteRequest(BaseModel):
@@ -180,6 +180,10 @@ def create_question(req: QuestionCreate, authorization: Optional[str] = Header(N
     user = get_user_optional(authorization)
     tags = normalize_tags(req.tags)
     now = utc_now()
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    body = (req.body or "").strip()
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -189,8 +193,8 @@ def create_question(req: QuestionCreate, authorization: Optional[str] = Header(N
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                req.title.strip(),
-                req.body.strip(),
+                title,
+                body,
                 ",".join(tags),
                 user.sub,
                 user.name,
@@ -238,6 +242,9 @@ def create_answer(
 ):
     user = get_user_optional(authorization)
     now = utc_now()
+    body = req.body.strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="Comment is required")
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -252,7 +259,7 @@ def create_answer(
             """,
             (
                 question_id,
-                req.body.strip(),
+                body,
                 user.sub,
                 user.name,
                 user.picture,

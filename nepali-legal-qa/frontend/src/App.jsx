@@ -5,6 +5,7 @@ import { Landing } from './Landing'
 import { About } from './About'
 import { Chat } from './Chat'
 import { Forum } from './Forum'
+import { ForumDetail } from './ForumDetail'
 
 export default function App() {
   const [user, setUser] = useState(null)
@@ -64,6 +65,7 @@ export default function App() {
         <Route path="/about" element={<About />} />
         <Route path="/chat" element={<Chat user={user} onLogout={handleLogout} />} />
         <Route path="/forum" element={<Forum user={user} onLogout={handleLogout} />} />
+        <Route path="/forum/:id" element={<ForumDetail user={user} onLogout={handleLogout} />} />
         <Route path="/login" element={<Navigate to="/" replace />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
