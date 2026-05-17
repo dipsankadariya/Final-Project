@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import { UserProfile } from './GoogleLogin'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -299,6 +300,12 @@ export function Chat({ user, onLogout }) {
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
               <span className="hidden sm:block">Baseline RAG • HyDE RAG • FAISS</span>
             </div>
+            <Link
+              to="/forum"
+              className="hidden md:inline-flex items-center px-3 py-1.5 text-[11px] font-semibold rounded-full border border-purple-200 text-purple-700 hover:bg-purple-50 transition-colors"
+            >
+              Forum
+            </Link>
             {user && <UserProfile user={user} onLogout={onLogout} />}
           </div>
         </div>

@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const proxyTarget = env.VITE_API_BASE || 'http://localhost:8000'
+  const forumTarget = env.VITE_FORUM_API_BASE || 'http://localhost:8001'
 
   return {
     plugins: [react()],
@@ -12,6 +13,10 @@ export default defineConfig(({ mode }) => {
       // Proxy all /api/* requests to the backend (Colab URL or localhost)
       // This avoids CORS issues when developing locally.
       proxy: {
+        '/api/forum': {
+          target: forumTarget,
+          changeOrigin: true,
+        },
         '/api': {
           target: proxyTarget,
           changeOrigin: true,

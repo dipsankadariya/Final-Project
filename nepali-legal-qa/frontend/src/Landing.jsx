@@ -20,6 +20,9 @@ export function Landing() {
             <Link to="/about" className="text-sm text-gray-600 hover:text-gray-900 font-medium transition-colors">
               About
             </Link>
+            <Link to="/forum" className="text-sm text-gray-600 hover:text-gray-900 font-medium transition-colors">
+              Forum
+            </Link>
             <Link
               to="/chat"
               className="px-6 py-2.5 text-sm font-semibold text-white bg-purple-600 hover:bg-purple-700 rounded transition-all shadow-md hover:shadow-lg hover:shadow-purple-200/50 hover:-translate-y-0.5"

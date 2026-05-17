@@ -4,6 +4,7 @@ import { LoginCard } from './GoogleLogin'
 import { Landing } from './Landing'
 import { About } from './About'
 import { Chat } from './Chat'
+import { Forum } from './Forum'
 
 export default function App() {
   const [user, setUser] = useState(null)
@@ -62,6 +63,7 @@ export default function App() {
         <Route path="/" element={<Landing />} />
         <Route path="/about" element={<About />} />
         <Route path="/chat" element={<Chat user={user} onLogout={handleLogout} />} />
+        <Route path="/forum" element={<Forum user={user} onLogout={handleLogout} />} />
         <Route path="/login" element={<Navigate to="/" replace />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

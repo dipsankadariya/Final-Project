@@ -39,21 +39,13 @@ Groq llama-3.3-70b-versatile generates the final Nepali answer
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐       ┌──────────────────────────────┐
-│      GOOGLE COLAB  (GPU T4)         │       │      LOCAL MACHINE           │
-│                                     │       │                              │
-│  collab-backend.ipynb               │       │  frontend/  (React + Vite)   │
-│  ├─ Cell 1: install deps            │       │  ├─ npm run dev → :3000      │
-│  ├─ Cell 2: set env vars + ngrok    │◄──────┤  ├─ VITE_API_BASE = ngrok   │
-│  └─ Cell 3: uvicorn main:app :8000  │       │  └─ /api/* proxied → Colab  │
-│                                     │       └──────────────────────────────┘
-│  backend/main.py  (FastAPI)         │
-│  ├─ GET  /api/health                │
-│  └─ POST /api/query                 │
-│      ├─ HyDE via local SLM          │
-│      ├─ FAISS retrieval (LaBSE)     │
-│      └─ Answer via Groq LLM         │
-└─────────────────────────────────────┘
+┌──────────────────────────────────┐       ┌──────────────────────────────────┐
+│ GOOGLE COLAB (GPU T4)            │       │ LOCAL MACHINE                    │
+│ collab-backend.ipynb             │       │ frontend/ (React + Vite)         │
+│ - uvicorn main:app :8000         │◄──────┤ - npm run dev :3000              │
+│ backend/main.py (RAG API)        │       │ forum_api.py (SQLite) :8001      │
+│ /api/query                       │       │ /api/forum/*                     │
+└──────────────────────────────────┘       └──────────────────────────────────┘
 ```
 
 ---
@@ -61,7 +53,7 @@ Groq llama-3.3-70b-versatile generates the final Nepali answer
 ## Project structure
 
 ```
-College-project/
+RAG-based-QA-System/
 ├── nepali_rag_qa.ipynb               ← Original RAG research notebook
 ├── Complete_slm_finetune.ipynb        ← SLM fine-tuning pipeline (Kaggle)
 ├── collab-backend.ipynb               ← Run this in Google Colab (GPU)
@@ -74,10 +66,12 @@ College-project/
     ├── README.md
     ├── .gitignore
     │
-    ├── backend/
-    │   ├── main.py               ← FastAPI app (exact pipeline from nepali_rag_qa.ipynb)
-    │   ├── requirements.txt      ← Python dependencies
-    │   └── .env.example          ← Config reference
+   ├── backend/
+   │   ├── main.py               ← RAG FastAPI app (Colab)
+   │   ├── forum_api.py          ← Forum FastAPI app (local)
+   │   ├── forum_db.py           ← SQLite helpers
+   │   ├── requirements.txt      ← Python dependencies
+   │   └── .env.example          ← Config reference
     │
     └── frontend/
         ├── src/
@@ -122,7 +116,7 @@ College-project/
 
 ---
 
-### Step 1 — Start the backend in Google Colab
+### Step 1 — Start the RAG backend in Google Colab
 
 1. Open **[collab-backend.ipynb](./collab-backend.ipynb)** in [Google Colab](https://colab.research.google.com)
 
@@ -130,8 +124,8 @@ College-project/
 
 3. **Run Cell 1** — clones the repo and installs dependencies:
    ```python
-   !git clone https://github.com/dipsankadariya/College-project.git
-   %cd College-project/backend
+   !git clone https://github.com/dipsankadariya/RAG-based-QA-System.git
+   %cd RAG-based-QA-System/nepali-legal-qa/backend
    !pip install -r requirements.txt
    !pip install pyngrok
    ```
@@ -151,11 +145,11 @@ College-project/
    os.environ["GROQ_API_KEY_4"] = userdata.get("GROQ_API_KEY_4")
 
    from pyngrok import ngrok
-   ngrok.set_auth_token("YOUR_NGROK_TOKEN_HERE")   # ← paste your token
+   ngrok.set_auth_token(userdata.get("NGROK_TOKEN"))
    public_url = ngrok.connect(8000, "http")
    print(public_url)   # e.g. https://xxxx-xxxx.ngrok-free.app
    ```
-   📋 **Copy this URL** — you need it in Step 2.
+   📋 **Copy this URL** — you need it in Step 3.
 
 6. **Run Cell 3** — start the FastAPI server (keep this cell running):
    ```
@@ -174,7 +168,19 @@ College-project/
 
 ---
 
-### Step 2 — Start the frontend locally
+### Step 2 — Start the forum backend locally (fast demo)
+
+1. Open a new terminal:
+   ```bash
+   cd nepali-legal-qa/backend
+   ```
+
+2. Start the forum API (SQLite):
+   ```bash
+   uvicorn forum_api:app --reload --port 8001
+   ```
+
+### Step 3 — Start the frontend locally
 
 1. Open a terminal, navigate to the frontend directory:
    ```bash
@@ -189,6 +195,7 @@ College-project/
 3. Set the backend URL — edit `frontend/.env`:
    ```env
    VITE_API_BASE=https://xxxx-xxxx.ngrok-free.app
+   VITE_FORUM_API_BASE=http://localhost:8001
    ```
    > ⚠️ **This URL changes every Colab session.** Update `.env` and restart `npm run dev` each time.
 
@@ -214,6 +221,14 @@ Browser → localhost:3000/api/query
     [1] Local SLM generates HyDE passage (CUDA)
     [2] LaBSE embeds it → FAISS retrieves top 3 chunks
     [3] Groq llama-3.3-70b answers in Nepali
+
+Browser → localhost:3000/api/forum/*
+           ↓
+   Vite dev server (proxy)
+           ↓
+   http://localhost:8001/api/forum/*
+           ↓
+   Forum FastAPI (SQLite)
 ```
 
 The Vite proxy handles CORS and ngrok headers automatically.
